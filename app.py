@@ -42,6 +42,22 @@ def login():
     token = make_token(email, role)
     return jsonify(token=token, role=role, email=email)
 
+# ---- AUTH REGISTER STUB (no DB yet) ----
+@app.post("/auth/register")
+def register():
+    data = request.get_json(force=True)
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+
+    if not email or not password:
+        return jsonify(error="email and password required"), 400
+    if len(password) < 8:
+        return jsonify(error="password too short"), 400
+
+    role = "manager"
+    token = make_token(email, role)
+    return jsonify(token=token, role=role, email=email), 201
+
 @app.get("/auth/me")
 def me():
     auth = request.headers.get("authorization", "")
@@ -51,5 +67,5 @@ def me():
     try:
         claims = verify_token(token)
         return jsonify(ok=True, user={"email": claims["sub"], "role": claims["role"]})
-    except Exception as e:
+    except Exception:
         return jsonify(error="invalid token"), 401
