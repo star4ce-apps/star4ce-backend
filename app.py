@@ -51,12 +51,20 @@ def register():
 
     if not email or not password:
         return jsonify(error="email and password required"), 400
-    if len(password) < 8:
-        return jsonify(error="password too short"), 400
 
+    if len(password) < 8:
+        return jsonify(error="password must be at least 8 characters"), 400
+
+    # For now — every new user is manager role
     role = "manager"
+
     token = make_token(email, role)
-    return jsonify(token=token, role=role, email=email), 201
+    return jsonify(
+        ok=True,
+        token=token,
+        role=role,
+        email=email
+    )
 
 @app.get("/auth/me")
 def me():
