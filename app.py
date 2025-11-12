@@ -147,6 +147,32 @@ def me():
     except Exception:
         return jsonify(error="invalid token"), 401
 
+@app.post("/auth/verify")
+def verify_account():
+    data = request.get_json(force=True)
+    email = (data.get("email") or "").strip().lower()
+    code = (data.get("code") or "").strip()
+
+    if not email or not code:
+        return jsonify(error="email and code required"), 400
+
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        return jsonify(error="invalid code or email"), 400
+
+    # Compare with latest stored code
+    if not user.verify_code or user.verify_code != code:
+        return jsonify(error="invalid code or email"), 400
+
+    # Mark verified and clear code
+    user.is_verified = True
+    user.verify_code = None
+    db.session.commit()
+
+    # Issue a fresh token so the client can log the user in right away
+    token = make_token(user.email, user.role)
+
+    return jsonify(ok=True, token=token, email=user.email, role=user.role)
 
 if __name__ == "__main__":
     app.run(debug=True)
