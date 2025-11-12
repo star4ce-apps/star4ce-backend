@@ -1,10 +1,9 @@
-﻿import os, datetime, jwt
+﻿import os, datetime, jwt, random
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from dotenv import load_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
-import os, datetime, jwt, random
 
 load_dotenv()
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret")
