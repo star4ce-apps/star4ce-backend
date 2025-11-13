@@ -174,5 +174,95 @@ def verify_account():
 
     return jsonify(ok=True, token=token, email=user.email, role=user.role)
 
+@app.post("/auth/resend-verify")
+def resend_verify():
+    data = request.get_json(force=True)
+    email = (data.get("email") or "").strip().lower()
+
+    if not email:
+        return jsonify(error="email required"), 400
+
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        return jsonify(error="no such user"), 404
+
+    # If already verified, nothing to do
+    if user.is_verified:
+        return jsonify(ok=True, already_verified=True)
+
+    import random
+    user.verify_code = f"{random.randint(0, 999999):06d}"
+    db.session.commit()
+
+    # Dev-only: return the code in JSON. Later, send via email.
+    return jsonify(ok=True, verification_code=user.verify_code)
+
+@app.post("/auth/request-reset")
+def request_reset():
+    data = request.get_json(force=True)
+    email = (data.get("email") or "").strip().lower()
+
+    if not email:
+        return jsonify(error="email required"), 400
+
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        # For dev, we’ll be explicit. In production you might return ok=True always.
+        return jsonify(error="no account with that email"), 404
+
+    # Generate a 6-digit reset code
+    reset_code = f"{random.randint(0, 999999):06d}"
+    expires_at = datetime.datetime.utcnow() + datetime.timedelta(minutes=15)
+
+    user.reset_code = reset_code
+    user.reset_code_expires_at = expires_at
+    db.session.commit()
+
+    # Dev-only: return the code in JSON.
+    # Later you’ll send this via email instead.
+    return jsonify(
+        ok=True,
+        reset_code=reset_code,
+        expires_at=expires_at.isoformat() + "Z",
+    )
+
+@app.post("/auth/reset")
+def reset_password():
+    data = request.get_json(force=True)
+    email = (data.get("email") or "").strip().lower()
+    code = (data.get("code") or "").strip()
+    new_password = data.get("new_password") or ""
+
+    if not email or not code or not new_password:
+        return jsonify(error="email, code, and new_password required"), 400
+
+    if len(new_password) < 8:
+        return jsonify(error="password must be at least 8 characters"), 400
+
+    user = User.query.filter_by(email=email).first()
+    if not user or not user.reset_code or user.reset_code != code:
+        return jsonify(error="invalid code or email"), 400
+
+    # Check expiration
+    if user.reset_code_expires_at and user.reset_code_expires_at < datetime.datetime.utcnow():
+        return jsonify(error="reset code expired"), 400
+
+    # Update password
+    user.password_hash = generate_password_hash(new_password)
+    user.reset_code = None
+    user.reset_code_expires_at = None
+    db.session.commit()
+
+    # Optional: log them in immediately with a new token
+    token = make_token(user.email, user.role)
+
+    return jsonify(
+        ok=True,
+        token=token,
+        email=user.email,
+        role=user.role,
+    )
+
+
 if __name__ == "__main__":
     app.run(debug=True)
