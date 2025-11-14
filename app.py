@@ -338,51 +338,38 @@ def me():
 @app.get("/analytics/summary")
 def analytics_summary():
     """
-    Example protected endpoint.
+    Analytics are ONLY visible to verified 'admin' users.
 
-    - Only verified 'admin' or 'corporate' users can access
-    - 'admin' sees data for their dealership only
-    - 'corporate' could see all dealerships (for now we just return total counts)
+    - 'admin' sees data for their own dealership (by dealership_id)
+    - 'manager' and 'corporate' are blocked here
     """
 
     user, err = get_current_user()
     if err:
-        return err  # 401 or 403 from helper
+        return err  # 401 / 403 from helper
 
-    if user.role not in ("admin", "corporate"):
-        return jsonify(error="forbidden – insufficient role"), 403
+    # Only admins allowed
+    if user.role != "admin":
+        return jsonify(error="forbidden – analytics only available to admins"), 403
 
-    # For now, just return some simple counts, we’ll make it richer later.
-    if user.role == "corporate":
-        # corporate could see all dealerships
-        total_answers = SurveyAnswer.query.count()
-        total_dealerships = Dealership.query.count()
-        return jsonify(
-            ok=True,
-            scope="corporate",
-            total_dealerships=total_dealerships,
-            total_answers=total_answers,
-        )
-    else:
-        # admin – limit to their dealership
-        if not user.dealership_id:
-            return jsonify(
-                ok=True,
-                scope="admin",
-                message="No dealership assigned to this admin yet.",
-                total_answers=0,
-            )
-
-        total_answers = SurveyAnswer.query.filter_by(
-            dealership_id=user.dealership_id
-        ).count()
-
+    if not user.dealership_id:
         return jsonify(
             ok=True,
             scope="admin",
-            dealership_id=user.dealership_id,
-            total_answers=total_answers,
+            message="No dealership assigned to this admin yet.",
+            total_answers=0,
         )
+
+    total_answers = SurveyAnswer.query.filter_by(
+        dealership_id=user.dealership_id
+    ).count()
+
+    return jsonify(
+        ok=True,
+        scope="admin",
+        dealership_id=user.dealership_id,
+        total_answers=total_answers,
+    )
 
 @app.post("/auth/verify")
 def verify_email():
