@@ -5,6 +5,7 @@ from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from dotenv import load_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
+from flask import g
 
 load_dotenv()
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret")
@@ -27,17 +28,47 @@ app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv(
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
+class Dealership(db.Model):
+    __tablename__ = "dealerships"
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255), nullable=False)
+    address = db.Column(db.String(255), nullable=True)
+    city = db.Column(db.String(100), nullable=True)
+    state = db.Column(db.String(50), nullable=True)
+    zip_code = db.Column(db.String(20), nullable=True)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "name": self.name,
+            "address": self.address,
+            "city": self.city,
+            "state": self.state,
+            "zip_code": self.zip_code,
+        }
+
+
 class User(db.Model):
     __tablename__ = "users"
 
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(db.String(255), unique=True, nullable=False)
     password_hash = db.Column(db.String(255), nullable=False)
+
+    # Roles:
+    # - "admin"      = owner of a single dealership
+    # - "manager"    = manager at a dealership
+    # - "corporate"  = can see across dealerships
     role = db.Column(
         db.String(50),
         nullable=False,
-        default="manager"  # default for normal dealership staff
+        default="manager",
     )
+
+    # Which dealership this user belongs to (can be NULL for corporate)
+    dealership_id = db.Column(db.Integer, db.ForeignKey("dealerships.id"), nullable=True)
+    dealership = db.relationship("Dealership", backref="users")
 
     # email verification
     is_verified = db.Column(db.Boolean, nullable=False, default=False)
@@ -50,7 +81,40 @@ class User(db.Model):
             "email": self.email,
             "role": self.role,
             "is_verified": self.is_verified,
+            "dealership_id": self.dealership_id,
         }
+
+
+class SurveyAccessCode(db.Model):
+    __tablename__ = "survey_access_codes"
+
+    id = db.Column(db.Integer, primary_key=True)
+    code = db.Column(db.String(16), unique=True, nullable=False)
+
+    dealership_id = db.Column(db.Integer, db.ForeignKey("dealerships.id"), nullable=False)
+    dealership = db.relationship("Dealership", backref="access_codes")
+
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.datetime.utcnow)
+    expires_at = db.Column(db.DateTime, nullable=True)
+    is_active = db.Column(db.Boolean, nullable=False, default=True)
+
+
+class SurveyAnswer(db.Model):
+    __tablename__ = "survey_answers"
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    dealership_id = db.Column(db.Integer, db.ForeignKey("dealerships.id"), nullable=False)
+    dealership = db.relationship("Dealership", backref="survey_answers")
+
+    access_code_id = db.Column(db.Integer, db.ForeignKey("survey_access_codes.id"), nullable=True)
+    access_code = db.relationship("SurveyAccessCode", backref="answers")
+
+    # Store survey responses as a JSON string (we’ll parse in Python)
+    payload = db.Column(db.Text, nullable=False)
+
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.datetime.utcnow)
+
 
 
 class SurveyResponse(db.Model):
@@ -103,6 +167,38 @@ def make_token(email: str, role: str = "manager"):
 
 def verify_token(token: str):
     return jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+
+def get_current_user():
+    """
+    Reads the Bearer token from Authorization header,
+    verifies it, and returns the User object.
+    Returns (user, error_response) so callers can handle 401/403 cleanly.
+    """
+    auth = request.headers.get("Authorization", "") or request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        return None, (jsonify(error="missing bearer token"), 401)
+
+    token = auth.split(" ", 1)[1].strip()
+    try:
+        claims = verify_token(token)
+    except Exception:
+        return None, (jsonify(error="invalid token"), 401)
+
+    email = claims.get("sub")
+    if not email:
+        return None, (jsonify(error="invalid token payload"), 401)
+
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        return None, (jsonify(error="user not found"), 401)
+
+    # Require email to be verified to access protected routes
+    if not user.is_verified:
+        return None, (jsonify(error="unverified"), 403)
+
+    # Store on flask.g if you ever want it elsewhere
+    g.current_user = user
+    return user, None
 
 def send_verification_email(to_email: str, code: str):
   """
@@ -238,6 +334,55 @@ def me():
         return jsonify(ok=True, user={"email": claims["sub"], "role": claims["role"]})
     except Exception:
         return jsonify(error="invalid token"), 401
+    
+@app.get("/analytics/summary")
+def analytics_summary():
+    """
+    Example protected endpoint.
+
+    - Only verified 'admin' or 'corporate' users can access
+    - 'admin' sees data for their dealership only
+    - 'corporate' could see all dealerships (for now we just return total counts)
+    """
+
+    user, err = get_current_user()
+    if err:
+        return err  # 401 or 403 from helper
+
+    if user.role not in ("admin", "corporate"):
+        return jsonify(error="forbidden – insufficient role"), 403
+
+    # For now, just return some simple counts, we’ll make it richer later.
+    if user.role == "corporate":
+        # corporate could see all dealerships
+        total_answers = SurveyAnswer.query.count()
+        total_dealerships = Dealership.query.count()
+        return jsonify(
+            ok=True,
+            scope="corporate",
+            total_dealerships=total_dealerships,
+            total_answers=total_answers,
+        )
+    else:
+        # admin – limit to their dealership
+        if not user.dealership_id:
+            return jsonify(
+                ok=True,
+                scope="admin",
+                message="No dealership assigned to this admin yet.",
+                total_answers=0,
+            )
+
+        total_answers = SurveyAnswer.query.filter_by(
+            dealership_id=user.dealership_id
+        ).count()
+
+        return jsonify(
+            ok=True,
+            scope="admin",
+            dealership_id=user.dealership_id,
+            total_answers=total_answers,
+        )
 
 @app.post("/auth/verify")
 def verify_email():
