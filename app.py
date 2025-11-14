@@ -1,4 +1,5 @@
-﻿import os, datetime, jwt, random
+﻿import os, datetime, jwt, smtplib, secrets
+from email.message import EmailMessage
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
@@ -7,6 +8,12 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 load_dotenv()
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret")
+
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
 
 app = Flask(__name__)
 CORS(app)
@@ -26,14 +33,16 @@ class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(db.String(255), unique=True, nullable=False)
     password_hash = db.Column(db.String(255), nullable=False)
-    role = db.Column(db.String(50), nullable=False, default="manager")
+    role = db.Column(
+        db.String(50),
+        nullable=False,
+        default="manager"  # default for normal dealership staff
+    )
 
-    # new fields
+    # email verification
     is_verified = db.Column(db.Boolean, nullable=False, default=False)
-    verify_code = db.Column(db.String(6), nullable=True)
-
-    reset_code = db.Column(db.String(6), nullable=True)
-    reset_code_expires_at = db.Column(db.DateTime, nullable=True)
+    verification_code = db.Column(db.String(6), nullable=True)
+    verification_expires_at = db.Column(db.DateTime, nullable=True)
 
     def to_dict(self):
         return {
@@ -43,6 +52,41 @@ class User(db.Model):
             "is_verified": self.is_verified,
         }
 
+
+class SurveyResponse(db.Model):
+    __tablename__ = "survey_responses"
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    # Which dealership / access code
+    access_code = db.Column(db.String(50), nullable=False)
+
+    # Employee metadata
+    employee_status = db.Column(db.String(50), nullable=False)   # 'newly-hired' | 'termination' | 'leave' | 'none'
+    role = db.Column(db.String(100), nullable=False)             # 'Sales Department', etc.
+
+    # Store answers as JSON blobs for now (flexible)
+    satisfaction_answers = db.Column(db.JSON, nullable=False)    # { 0: 'Very Satisfied', ... }
+    training_answers = db.Column(db.JSON, nullable=True)         # only for newly-hired
+
+    termination_reason = db.Column(db.String(100), nullable=True)
+    termination_other = db.Column(db.String(255), nullable=True)
+
+    leave_reason = db.Column(db.String(100), nullable=True)
+    leave_other = db.Column(db.String(255), nullable=True)
+
+    additional_feedback = db.Column(db.Text, nullable=True)
+
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "access_code": self.access_code,
+            "employee_status": self.employee_status,
+            "role": self.role,
+            "created_at": self.created_at.isoformat() + "Z",
+        }
 
 @app.get("/health")
 def health():
@@ -60,6 +104,46 @@ def make_token(email: str, role: str = "manager"):
 def verify_token(token: str):
     return jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
 
+def send_verification_email(to_email: str, code: str):
+  """
+  Sends a simple verification email with a 6-digit code.
+  Uses Gmail SMTP settings from .env.
+  """
+  if not (SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASSWORD and SMTP_FROM):
+      # In dev, just print so we don't crash if SMTP is not configured right
+      print(f"[DEV] Would send verification code {code} to {to_email}")
+      return
+
+  subject = "Star4ce – Verify your email"
+  body = f"""Hello,
+
+Thank you for registering with Star4ce.
+
+Your verification code is: {code}
+
+Enter this code on the verification page to activate your account.
+
+If you did not request this, you can ignore this email.
+
+– Star4ce
+"""
+
+  msg = EmailMessage()
+  msg["Subject"] = subject
+  msg["From"] = SMTP_FROM
+  msg["To"] = to_email
+  msg.set_content(body)
+
+  try:
+      with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+          server.starttls()
+          server.login(SMTP_USER, SMTP_PASSWORD)
+          server.send_message(msg)
+      print(f"[EMAIL] Sent verification email to {to_email}")
+  except Exception as e:
+      # Don't crash the app if email sending fails; just log it in dev
+      print(f"[EMAIL ERROR] Could not send verification email to {to_email}: {e}")
+
 # ---- AUTH STUB (no DB yet) ----
 @app.post("/auth/login")
 def login():
@@ -70,11 +154,16 @@ def login():
     if not email or not password:
         return jsonify(error="email and password required"), 400
 
+    
+
     # Look up user in DB
     user = User.query.filter_by(email=email).first()
     if not user:
         # Do not reveal which part is wrong
         return jsonify(error="invalid credentials"), 401
+
+    if not user.is_verified:
+        return jsonify(error="unverified"), 403
 
     if not check_password_hash(user.password_hash, password):
         return jsonify(error="invalid credentials"), 401
@@ -94,6 +183,7 @@ def register():
     data = request.get_json(force=True)
     email = (data.get("email") or "").strip().lower()
     password = data.get("password") or ""
+    incoming_role = (data.get("role") or "").strip()
 
     if not email or not password:
         return jsonify(error="email and password required"), 400
@@ -101,38 +191,40 @@ def register():
     if len(password) < 8:
         return jsonify(error="password must be at least 8 characters"), 400
 
-    # Check if user already exists
     existing = User.query.filter_by(email=email).first()
     if existing:
         return jsonify(error="email is already registered"), 400
 
-    # Default role for now; later we’ll decide admin/manager/corporate rules
-    role = "manager"
+    # Only allow known roles; fall back to 'manager'
+    valid_roles = {"manager", "admin", "corporate"}
+    role = incoming_role if incoming_role in valid_roles else "manager"
 
-    # Generate a 6-digit verification code (for email verification / resets later)
-    verify_code = f"{random.randint(0, 999999):06d}"
+    # Generate 6-digit verification code
+    code_int = secrets.randbelow(1_000_000)  # 0..999999
+    verification_code = f"{code_int:06d}"
+    expires_at = datetime.datetime.utcnow() + datetime.timedelta(hours=1)
 
     user = User(
         email=email,
         password_hash=generate_password_hash(password),
         role=role,
-        is_verified=True,          # ✅ keep true for now so login works without blocking
-        verify_code=verify_code,   # store latest code (we’ll use this later)
+        is_verified=False,
+        verification_code=verification_code,
+        verification_expires_at=expires_at,
     )
 
     db.session.add(user)
     db.session.commit()
 
-    # Issue JWT based on stored user (same as before)
-    token = make_token(user.email, user.role)
+    # Send verification email (best-effort)
+    send_verification_email(user.email, verification_code)
 
-    # Add verification_code for dev so you can see/test it
+    # Do NOT log them in yet; they must verify first.
     return jsonify(
         ok=True,
-        token=token,
-        role=user.role,
         email=user.email,
-        verification_code=verify_code   # dev-only; later sent via email
+        role=user.role,
+        message="Verification code sent to your email. Please verify before logging in."
     )
 
 @app.get("/auth/me")
@@ -148,31 +240,37 @@ def me():
         return jsonify(error="invalid token"), 401
 
 @app.post("/auth/verify")
-def verify_account():
+def verify_email():
     data = request.get_json(force=True)
     email = (data.get("email") or "").strip().lower()
     code = (data.get("code") or "").strip()
 
     if not email or not code:
-        return jsonify(error="email and code required"), 400
+        return jsonify(error="email and code are required"), 400
 
     user = User.query.filter_by(email=email).first()
     if not user:
-        return jsonify(error="invalid code or email"), 400
+        return jsonify(error="user not found"), 400
 
-    # Compare with latest stored code
-    if not user.verify_code or user.verify_code != code:
-        return jsonify(error="invalid code or email"), 400
+    if user.is_verified:
+        return jsonify(error="already verified"), 400
 
-    # Mark verified and clear code
+    # Check code
+    if not user.verification_code or user.verification_code != code:
+        return jsonify(error="invalid verification code"), 400
+
+    # Check expiry
+    if user.verification_expires_at and user.verification_expires_at < datetime.datetime.utcnow():
+        return jsonify(error="verification code expired"), 400
+
+    # Mark verified
     user.is_verified = True
-    user.verify_code = None
+    user.verification_code = None
+    user.verification_expires_at = None
+
     db.session.commit()
 
-    # Issue a fresh token so the client can log the user in right away
-    token = make_token(user.email, user.role)
-
-    return jsonify(ok=True, token=token, email=user.email, role=user.role)
+    return jsonify(ok=True, email=user.email, role=user.role)
 
 @app.post("/auth/resend-verify")
 def resend_verify():
@@ -180,22 +278,27 @@ def resend_verify():
     email = (data.get("email") or "").strip().lower()
 
     if not email:
-        return jsonify(error="email required"), 400
+        return jsonify(error="email is required"), 400
 
     user = User.query.filter_by(email=email).first()
     if not user:
-        return jsonify(error="no such user"), 404
+        return jsonify(error="user not found"), 400
 
-    # If already verified, nothing to do
     if user.is_verified:
-        return jsonify(ok=True, already_verified=True)
+        return jsonify(error="already verified"), 400
 
-    import random
-    user.verify_code = f"{random.randint(0, 999999):06d}"
+    # New 6-digit code
+    code_int = secrets.randbelow(1_000_000)
+    verification_code = f"{code_int:06d}"
+    expires_at = datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+
+    user.verification_code = verification_code
+    user.verification_expires_at = expires_at
     db.session.commit()
 
-    # Dev-only: return the code in JSON. Later, send via email.
-    return jsonify(ok=True, verification_code=user.verify_code)
+    send_verification_email(user.email, verification_code)
+
+    return jsonify(ok=True, message="Verification code resent")
 
 @app.post("/auth/request-reset")
 def request_reset():
@@ -262,6 +365,55 @@ def reset_password():
         email=user.email,
         role=user.role,
     )
+
+@app.post("/survey/submit")
+def submit_survey():
+    """
+    Public endpoint: called by the Survey page.
+    Saves one anonymous survey response tied to an access_code.
+    """
+    data = request.get_json(force=True)
+
+    access_code = (data.get("access_code") or "").strip()
+    employee_status = (data.get("employee_status") or "").strip()
+    role = (data.get("role") or "").strip()
+
+    satisfaction_answers = data.get("satisfaction_answers") or {}
+    training_answers = data.get("training_answers") or {}
+
+    termination_reason = data.get("termination_reason") or None
+    termination_other = data.get("termination_other") or None
+    leave_reason = data.get("leave_reason") or None
+    leave_other = data.get("leave_other") or None
+    additional_feedback = data.get("additional_feedback") or None
+
+    # basic validation
+    if not access_code or not employee_status or not role:
+        return jsonify(error="access_code, employee_status, and role are required"), 400
+
+    if not isinstance(satisfaction_answers, dict):
+        return jsonify(error="satisfaction_answers must be an object"), 400
+
+    if training_answers and not isinstance(training_answers, dict):
+        return jsonify(error="training_answers must be an object"), 400
+
+    resp = SurveyResponse(
+        access_code=access_code,
+        employee_status=employee_status,
+        role=role,
+        satisfaction_answers=satisfaction_answers,
+        training_answers=training_answers or None,
+        termination_reason=termination_reason,
+        termination_other=termination_other,
+        leave_reason=leave_reason,
+        leave_other=leave_other,
+        additional_feedback=additional_feedback,
+    )
+
+    db.session.add(resp)
+    db.session.commit()
+
+    return jsonify(ok=True, id=resp.id)
 
 
 if __name__ == "__main__":
