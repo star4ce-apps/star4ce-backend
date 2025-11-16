@@ -279,7 +279,6 @@ def register():
     data = request.get_json(force=True)
     email = (data.get("email") or "").strip().lower()
     password = data.get("password") or ""
-    incoming_role = (data.get("role") or "").strip()
 
     if not email or not password:
         return jsonify(error="email and password required"), 400
@@ -291,9 +290,9 @@ def register():
     if existing:
         return jsonify(error="email is already registered"), 400
 
-    # Only allow known roles; fall back to 'manager'
-    valid_roles = {"manager", "admin", "corporate"}
-    role = incoming_role if incoming_role in valid_roles else "manager"
+    # Public registration ALWAYS creates a manager.
+    # Admin / corporate accounts will be created/updated internally only.
+    role = "manager"
 
     # Generate 6-digit verification code
     code_int = secrets.randbelow(1_000_000)  # 0..999999
