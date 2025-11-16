@@ -207,7 +207,8 @@ def send_verification_email(to_email: str, code: str):
   """
   if not (SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASSWORD and SMTP_FROM):
       # In dev, just print so we don't crash if SMTP is not configured right
-      print(f"[DEV] Would send verification code {code} to {to_email}")
+      print(f"[DEV MODE] Verification code for {to_email} = {code}")
+
       return
 
   subject = "Star4ce – Verify your email"
@@ -495,6 +496,60 @@ def reset_password():
         token=token,
         email=user.email,
         role=user.role,
+    )
+
+def generate_access_code(length: int = 8) -> str:
+    """
+    Generate a human-friendly code: no 0/O/1/I to avoid confusion.
+    Example: 7K2F9QBD
+    """
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+@app.post("/survey/access-codes")
+def create_access_code():
+    """
+    Admin-only endpoint.
+    Creates a new survey access code for the admin's dealership.
+    """
+    user, err = get_current_user()
+    if err:
+        return err  # 401 / 403
+
+    # Must be an admin with a dealership
+    if user.role != "admin":
+        return jsonify(error="only admins can create survey access codes"), 403
+
+    if not user.dealership_id:
+        return jsonify(error="admin has no dealership assigned"), 400
+
+    # Optional: read an expiry from the request body (in hours), else None
+    data = request.get_json(silent=True) or {}
+    hours = data.get("expires_in_hours")
+    expires_at = None
+    if isinstance(hours, (int, float)) and hours > 0:
+        expires_at = datetime.datetime.utcnow() + datetime.timedelta(hours=hours)
+
+    code = generate_access_code()
+
+    access = SurveyAccessCode(
+        code=code,
+        dealership_id=user.dealership_id,
+        expires_at=expires_at,
+        is_active=True,
+    )
+    db.session.add(access)
+    db.session.commit()
+
+    return jsonify(
+        ok=True,
+        id=access.id,
+        code=access.code,
+        dealership_id=access.dealership_id,
+        created_at=access.created_at.isoformat() + "Z",
+        expires_at=access.expires_at.isoformat() + "Z" if access.expires_at else None,
+        is_active=access.is_active,
     )
 
 @app.post("/survey/submit")
