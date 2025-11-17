@@ -241,6 +241,49 @@ If you did not request this, you can ignore this email.
       # Don't crash the app if email sending fails; just log it in dev
       print(f"[EMAIL ERROR] Could not send verification email to {to_email}: {e}")
 
+def send_survey_invite_email(to_email: str, code: str):
+    """
+    Sends a survey invite email with the access code + link.
+    Uses the same SMTP settings as verification emails.
+    """
+    if not (SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASSWORD and SMTP_FROM):
+        print(f"[DEV] Would send SURVEY invite with code {code} to {to_email}")
+        return
+
+    subject = "Star4ce – Employee Experience Survey"
+    survey_link = f"http://localhost:3000/survey?code={code}"
+
+    body = f"""Hello,
+
+You have been invited to complete an anonymous Employee Experience Survey.
+
+Your access code is: {code}
+
+You can open the survey directly with this link:
+{survey_link}
+
+This code is unique to your dealership and may expire after a week.
+
+Thank you for your honest feedback.
+
+– Star4ce
+"""
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = SMTP_FROM
+    msg["To"] = to_email
+    msg.set_content(body)
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+        print(f"[EMAIL] Sent survey invite to {to_email} with code {code}")
+    except Exception as e:
+        print(f"[EMAIL ERROR] Could not send survey invite to {to_email}: {e}")
+
 # ---- AUTH STUB (no DB yet) ----
 @app.post("/auth/login")
 def login():
@@ -506,7 +549,6 @@ def generate_access_code(length: int = 8) -> str:
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
-
 @app.post("/survey/access-codes")
 def create_access_code():
     """
@@ -552,30 +594,80 @@ def create_access_code():
         is_active=access.is_active,
     )
 
-@app.post("/survey/validate-code")
-def validate_code():
+@app.post("/survey/invite")
+def survey_invite():
+    """
+    Admin-only endpoint.
+    Sends a survey invite email with a given access code
+    to a specific employee email.
+    """
+    user, err = get_current_user()
+    if err:
+        return err  # 401/403
+
+    # For now: only 'admin' can invite employees for their dealership
+    if user.role != "admin":
+        return jsonify(error="forbidden – only admin can send survey invites"), 403
+
     data = request.get_json(force=True)
+    to_email = (data.get("email") or "").strip().lower()
     code = (data.get("code") or "").strip().upper()
 
-    if not code:
-        return jsonify(error="code required"), 400
+    if not to_email or not code:
+        return jsonify(error="email and code are required"), 400
 
-    ac = SurveyAccessCode.query.filter_by(code=code, is_active=True).first()
-    if not ac:
-        # Use 200 so the frontend can treat "invalid" as a normal response,
-        # not a network error.
-        return jsonify(ok=False, valid=False, error="Invalid or inactive access code"), 200
+    if not user.dealership_id:
+        return jsonify(error="admin has no dealership assigned"), 400
 
-    # Optional: check expiration
-    if ac.expires_at and ac.expires_at < datetime.datetime.utcnow():
-        return jsonify(ok=False, valid=False, error="This access code has expired"), 200
+    # Make sure this code belongs to THIS admin's dealership,
+    # is active, and not expired.
+    access = SurveyAccessCode.query.filter_by(
+        code=code,
+        dealership_id=user.dealership_id,
+        is_active=True,
+    ).first()
+
+    if not access:
+        return jsonify(error="access code not found for this dealership"), 400
+
+    if access.expires_at and access.expires_at < datetime.datetime.utcnow():
+        return jsonify(error="access code is expired"), 400
+
+    # Send the email
+    send_survey_invite_email(to_email, code)
 
     return jsonify(
         ok=True,
-        valid=True,
-        dealership_id=ac.dealership_id,
-        code=ac.code,
-        expires_at=ac.expires_at.isoformat() + "Z" if ac.expires_at else None,
+        message=f"Survey invite sent to {to_email}",
+        code=code,
+        dealership_id=user.dealership_id,
+    )
+
+@app.post("/survey/validate-code")
+def validate_access_code():
+    data = request.get_json(force=True)
+    access_code = (data.get("access_code") or "").strip()
+
+    if not access_code:
+        return jsonify(error="access_code is required"), 400
+
+    # Look up code in DB
+    code_obj = SurveyAccessCode.query.filter_by(code=access_code).first()
+
+    if not code_obj or not code_obj.is_active:
+        # You can customize this error text if you want
+        return jsonify(error="invalid or inactive access code"), 400
+
+    # Check expiry
+    if code_obj.expires_at and code_obj.expires_at < datetime.datetime.utcnow():
+        return jsonify(error="invalid or inactive access code"), 400
+
+    # If you want, you can return minimal info for frontend
+    return jsonify(
+        ok=True,
+        code=code_obj.code,
+        dealership_id=code_obj.dealership_id,
+        expires_at=code_obj.expires_at.isoformat() + "Z" if code_obj.expires_at else None,
     )
 
 @app.post("/survey/submit")
