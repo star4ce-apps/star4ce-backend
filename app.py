@@ -1,4 +1,4 @@
-﻿import os, datetime, jwt, smtplib, secrets
+﻿import os, datetime, jwt, smtplib, secrets, json
 from email.message import EmailMessage
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -552,15 +552,43 @@ def create_access_code():
         is_active=access.is_active,
     )
 
+@app.post("/survey/validate-code")
+def validate_code():
+    data = request.get_json(force=True)
+    code = (data.get("code") or "").strip().upper()
+
+    if not code:
+        return jsonify(error="code required"), 400
+
+    ac = SurveyAccessCode.query.filter_by(code=code, is_active=True).first()
+    if not ac:
+        # Use 200 so the frontend can treat "invalid" as a normal response,
+        # not a network error.
+        return jsonify(ok=False, valid=False, error="Invalid or inactive access code"), 200
+
+    # Optional: check expiration
+    if ac.expires_at and ac.expires_at < datetime.datetime.utcnow():
+        return jsonify(ok=False, valid=False, error="This access code has expired"), 200
+
+    return jsonify(
+        ok=True,
+        valid=True,
+        dealership_id=ac.dealership_id,
+        code=ac.code,
+        expires_at=ac.expires_at.isoformat() + "Z" if ac.expires_at else None,
+    )
+
 @app.post("/survey/submit")
 def submit_survey():
     """
     Public endpoint: called by the Survey page.
-    Saves one anonymous survey response tied to an access_code.
+    Saves one anonymous survey response tied to an access_code
+    AND to a specific dealership via SurveyAccessCode.
+    Also marks the access_code as used (one-time use).
     """
     data = request.get_json(force=True)
 
-    access_code = (data.get("access_code") or "").strip()
+    access_code = (data.get("access_code") or "").strip().upper()
     employee_status = (data.get("employee_status") or "").strip()
     role = (data.get("role") or "").strip()
 
@@ -573,7 +601,7 @@ def submit_survey():
     leave_other = data.get("leave_other") or None
     additional_feedback = data.get("additional_feedback") or None
 
-    # basic validation
+    # basic validation (same as before)
     if not access_code or not employee_status or not role:
         return jsonify(error="access_code, employee_status, and role are required"), 400
 
@@ -583,6 +611,18 @@ def submit_survey():
     if training_answers and not isinstance(training_answers, dict):
         return jsonify(error="training_answers must be an object"), 400
 
+    # 🔹 1) Look up and validate the access code in the DB
+    ac = SurveyAccessCode.query.filter_by(code=access_code, is_active=True).first()
+    if not ac:
+        return jsonify(error="Invalid or inactive access code"), 400
+
+    if ac.expires_at and ac.expires_at < datetime.datetime.utcnow():
+        return jsonify(error="This access code has expired"), 400
+
+    # 🔹 2) One-time use: immediately deactivate the code
+    ac.is_active = False
+
+    # 🔹 3) Save the structured response (for detailed analysis later)
     resp = SurveyResponse(
         access_code=access_code,
         employee_status=employee_status,
@@ -596,7 +636,27 @@ def submit_survey():
         additional_feedback=additional_feedback,
     )
 
+    # 🔹 4) ALSO save a dealership-level record for dashboards (SurveyAnswer)
+    payload = {
+        "employee_status": employee_status,
+        "role": role,
+        "satisfaction_answers": satisfaction_answers,
+        "training_answers": training_answers or None,
+        "termination_reason": termination_reason,
+        "termination_other": termination_other,
+        "leave_reason": leave_reason,
+        "leave_other": leave_other,
+        "additional_feedback": additional_feedback,
+    }
+
+    ans = SurveyAnswer(
+        dealership_id=ac.dealership_id,
+        access_code_id=ac.id,
+        payload=json.dumps(payload),
+    )
+
     db.session.add(resp)
+    db.session.add(ans)
     db.session.commit()
 
     return jsonify(ok=True, id=resp.id)
