@@ -468,37 +468,79 @@ def me():
 @app.get("/analytics/summary")
 def analytics_summary():
     """
-    Analytics are ONLY visible to verified 'admin' users.
+    Protected endpoint.
 
-    - 'admin' sees data for their own dealership (by dealership_id)
-    - 'manager' and 'corporate' are blocked here
+    - Only verified 'admin' or 'corporate' users can access
+    - 'admin' sees data for THEIR dealership only
+    - 'corporate' sees overall totals across all dealerships
+
+    Uses SurveyResponse + SurveyAccessCode so survey answers are tied
+    to the correct dealership via access_code.
     """
-
     user, err = get_current_user()
     if err:
-        return err  # 401 / 403 from helper
+        return err  # 401 / 403
 
-    # Only admins allowed
-    if user.role != "admin":
-        return jsonify(error="forbidden – analytics only available to admins"), 403
+    if user.role not in ("admin", "corporate"):
+        return jsonify(error="forbidden – insufficient role"), 403
 
+    # last 30 days window
+    cutoff_30 = datetime.datetime.utcnow() - datetime.timedelta(days=30)
+
+    if user.role == "corporate":
+        # All responses, across all dealerships
+        total_responses = SurveyResponse.query.count()
+        last_30 = SurveyResponse.query.filter(
+            SurveyResponse.created_at >= cutoff_30
+        ).count()
+
+        return jsonify(
+            ok=True,
+            scope="corporate",
+            total_dealerships=Dealership.query.count(),
+            total_answers=total_responses,   # keep old name for frontend
+            total_responses=total_responses, # extra, if we want later
+            last_30_days=last_30,
+        )
+
+    # --- admin branch ---
     if not user.dealership_id:
         return jsonify(
             ok=True,
             scope="admin",
             message="No dealership assigned to this admin yet.",
             total_answers=0,
+            total_responses=0,
+            last_30_days=0,
+            by_status={},
         )
 
-    total_answers = SurveyAnswer.query.filter_by(
-        dealership_id=user.dealership_id
-    ).count()
+    # Join SurveyResponse -> SurveyAccessCode by access_code
+    base_q = (
+        db.session.query(SurveyResponse)
+        .join(SurveyAccessCode, SurveyAccessCode.code == SurveyResponse.access_code)
+        .filter(SurveyAccessCode.dealership_id == user.dealership_id)
+    )
+
+    total_responses = base_q.count()
+    last_30 = base_q.filter(SurveyResponse.created_at >= cutoff_30).count()
+
+    # small breakdown by employee_status
+    status_counts = {
+        "newly-hired": base_q.filter(SurveyResponse.employee_status == "newly-hired").count(),
+        "termination": base_q.filter(SurveyResponse.employee_status == "termination").count(),
+        "leave": base_q.filter(SurveyResponse.employee_status == "leave").count(),
+        "none": base_q.filter(SurveyResponse.employee_status == "none").count(),
+    }
 
     return jsonify(
         ok=True,
         scope="admin",
         dealership_id=user.dealership_id,
-        total_answers=total_answers,
+        total_answers=total_responses,   # same name as before for frontend
+        total_responses=total_responses,
+        last_30_days=last_30,
+        by_status=status_counts,
     )
 
 @app.post("/auth/verify")
@@ -686,6 +728,44 @@ def create_access_code():
         created_at=access.created_at.isoformat() + "Z",
         expires_at=access.expires_at.isoformat() + "Z" if access.expires_at else None,
         is_active=access.is_active,
+    )
+
+@app.get("/survey/access-codes")
+def list_access_codes():
+    """
+    Admin-only endpoint.
+    Returns all survey access codes for the admin's dealership.
+    """
+    user, err = get_current_user()
+    if err:
+        return err  # 401 / 403
+
+    if user.role != "admin":
+        return jsonify(error="only admins can list survey access codes"), 403
+
+    if not user.dealership_id:
+        return jsonify(error="admin has no dealership assigned"), 400
+
+    codes = (
+        SurveyAccessCode.query
+        .filter_by(dealership_id=user.dealership_id)
+        .order_by(SurveyAccessCode.created_at.desc())
+        .all()
+    )
+
+    return jsonify(
+        ok=True,
+        items=[
+            {
+                "id": c.id,
+                "code": c.code,
+                "dealership_id": c.dealership_id,
+                "created_at": c.created_at.isoformat() + "Z",
+                "expires_at": c.expires_at.isoformat() + "Z" if c.expires_at else None,
+                "is_active": c.is_active,
+            }
+            for c in codes
+        ],
     )
 
 @app.post("/survey/invite")
