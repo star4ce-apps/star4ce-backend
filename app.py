@@ -1,4 +1,4 @@
-﻿import os, datetime, jwt, smtplib, secrets, json
+﻿import os, datetime, jwt, smtplib, secrets, json, random
 from email.message import EmailMessage
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -74,6 +74,9 @@ class User(db.Model):
     is_verified = db.Column(db.Boolean, nullable=False, default=False)
     verification_code = db.Column(db.String(6), nullable=True)
     verification_expires_at = db.Column(db.DateTime, nullable=True)
+
+    reset_code = db.Column(db.String(6), nullable=True)
+    reset_code_expires_at = db.Column(db.DateTime, nullable=True)
 
     def to_dict(self):
         return {
@@ -200,46 +203,75 @@ def get_current_user():
     g.current_user = user
     return user, None
 
-def send_verification_email(to_email: str, code: str):
-  """
-  Sends a simple verification email with a 6-digit code.
-  Uses Gmail SMTP settings from .env.
-  """
-  if not (SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASSWORD and SMTP_FROM):
-      # In dev, just print so we don't crash if SMTP is not configured right
-      print(f"[DEV MODE] Verification code for {to_email} = {code}")
+def send_verified_email(to_email: str):
+    """
+    Simple confirmation email once the account is verified.
+    """
+    if not (SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASSWORD and SMTP_FROM):
+        print(f"[DEV] Would send 'account verified' email to {to_email}")
+        return
 
-      return
+    subject = "Star4ce – Your account is verified"
+    body = f"""Hello,
 
-  subject = "Star4ce – Verify your email"
-  body = f"""Hello,
+Your Star4ce account ({to_email}) has been verified successfully.
 
-Thank you for registering with Star4ce.
+You can now sign in here:
+http://localhost:3000/login
 
-Your verification code is: {code}
+– Star4ce
+"""
 
-Enter this code on the verification page to activate your account.
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = SMTP_FROM
+    msg["To"] = to_email
+    msg.set_content(body)
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+        print(f"[EMAIL] Sent 'account verified' email to {to_email}")
+    except Exception as e:
+        print(f"[EMAIL ERROR] Could not send 'account verified' email to {to_email}: {e}")
+
+def send_reset_email(to_email: str, code: str):
+    """
+    Sends a password reset code email.
+    """
+    if not (SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASSWORD and SMTP_FROM):
+        print(f"[DEV] Would send reset code {code} to {to_email}")
+        return
+
+    subject = "Star4ce – Password reset code"
+    body = f"""Hello,
+
+We received a request to reset the password for your Star4ce account ({to_email}).
+
+Your password reset code is: {code}
+This code expires in 10 minutes.
 
 If you did not request this, you can ignore this email.
 
 – Star4ce
 """
 
-  msg = EmailMessage()
-  msg["Subject"] = subject
-  msg["From"] = SMTP_FROM
-  msg["To"] = to_email
-  msg.set_content(body)
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = SMTP_FROM
+    msg["To"] = to_email
+    msg.set_content(body)
 
-  try:
-      with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-          server.starttls()
-          server.login(SMTP_USER, SMTP_PASSWORD)
-          server.send_message(msg)
-      print(f"[EMAIL] Sent verification email to {to_email}")
-  except Exception as e:
-      # Don't crash the app if email sending fails; just log it in dev
-      print(f"[EMAIL ERROR] Could not send verification email to {to_email}: {e}")
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+        print(f"[EMAIL] Sent reset code email to {to_email}")
+    except Exception as e:
+        print(f"[EMAIL ERROR] Could not send reset email to {to_email}: {e}")
 
 def send_survey_invite_email(to_email: str, code: str):
     """
@@ -303,7 +335,22 @@ def login():
         return jsonify(error="invalid credentials"), 401
 
     if not user.is_verified:
-        return jsonify(error="unverified"), 403
+        # generate a fresh verification code and resend
+        code_int = secrets.randbelow(1_000_000)  # 0..999999
+        verification_code = f"{code_int:06d}"
+        expires_at = datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+
+        user.verification_code = verification_code
+        user.verification_expires_at = expires_at
+        db.session.commit()
+
+        send_verification_email(user.email, verification_code)
+
+        return jsonify(
+            error="unverified",
+            message="Your email is not verified yet. A new verification code has been sent."
+        ), 403
+
 
     if not check_password_hash(user.password_hash, password):
         return jsonify(error="invalid credentials"), 401
@@ -436,7 +483,10 @@ def verify_email():
 
     # Check expiry
     if user.verification_expires_at and user.verification_expires_at < datetime.datetime.utcnow():
-        return jsonify(error="verification code expired"), 400
+        # Delete unverified account so the email can be reused cleanly
+        db.session.delete(user)
+        db.session.commit()
+        return jsonify(error="verification code expired – please register again"), 400
 
     # Mark verified
     user.is_verified = True
@@ -485,19 +535,21 @@ def request_reset():
 
     user = User.query.filter_by(email=email).first()
     if not user:
-        # For dev, we’ll be explicit. In production you might return ok=True always.
+        # In prod you might return ok=True to avoid leaking which emails exist
         return jsonify(error="no account with that email"), 404
 
     # Generate a 6-digit reset code
     reset_code = f"{random.randint(0, 999999):06d}"
-    expires_at = datetime.datetime.utcnow() + datetime.timedelta(minutes=15)
+    expires_at = datetime.datetime.utcnow() + datetime.timedelta(minutes=10)
 
     user.reset_code = reset_code
     user.reset_code_expires_at = expires_at
     db.session.commit()
 
-    # Dev-only: return the code in JSON.
-    # Later you’ll send this via email instead.
+    # Send via email
+    send_reset_email(user.email, reset_code)
+
+    # Still return in JSON for dev/testing
     return jsonify(
         ok=True,
         reset_code=reset_code,
