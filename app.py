@@ -203,6 +203,46 @@ def get_current_user():
     g.current_user = user
     return user, None
 
+def send_verification_email(to_email: str, code: str):
+  """
+  Sends a simple verification email with a 6-digit code.
+  Uses Gmail SMTP settings from .env.
+  """
+  if not (SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASSWORD and SMTP_FROM):
+      # In dev, just print so we don't crash if SMTP is not configured right
+      print(f"[DEV] Would send verification code {code} to {to_email}")
+      return
+
+  subject = "Star4ce – Verify your email"
+  body = f"""Hello,
+
+Thank you for registering with Star4ce.
+
+Your verification code is: {code}
+
+Enter this code on the verification page to activate your account.
+
+If you did not request this, you can ignore this email.
+
+– Star4ce
+"""
+
+  msg = EmailMessage()
+  msg["Subject"] = subject
+  msg["From"] = SMTP_FROM
+  msg["To"] = to_email
+  msg.set_content(body)
+
+  try:
+      with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+          server.starttls()
+          server.login(SMTP_USER, SMTP_PASSWORD)
+          server.send_message(msg)
+      print(f"[EMAIL] Sent verification email to {to_email}")
+  except Exception as e:
+      # Don't crash the app if email sending fails; just log it in dev
+      print(f"[EMAIL ERROR] Could not send verification email to {to_email}: {e}")
+
 def send_verified_email(to_email: str):
     """
     Simple confirmation email once the account is verified.
@@ -494,6 +534,8 @@ def verify_email():
     user.verification_expires_at = None
 
     db.session.commit()
+
+    send_verified_email(user.email)
 
     return jsonify(ok=True, email=user.email, role=user.role)
 
