@@ -19,27 +19,20 @@ SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
 app = Flask(__name__)
 CORS(app)
 
-# Dev: uses local SQLite file "star4ce.db"
-# app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv(
-#     "DATABASE_URL",
-#     "sqlite:///star4ce.db"
-# )
-#######
+# --- DATABASE SETUP ---
+raw_db_url = os.getenv("DATABASE_URL", "sqlite:///star4ce.db")
 
-# Prod later: set DATABASE_URL in env to use Postgres on Render.
-db_url = os.getenv("DATABASE_URL")
-if not db_url:
-    raise RuntimeError("DATABASE_URL is not set – required in production")
+# Render / Heroku format fix
+if raw_db_url.startswith("postgres://"):
+    raw_db_url = raw_db_url.replace("postgres://", "postgresql://", 1)
 
-app.config["SQLALCHEMY_DATABASE_URI"] = db_url
-######
-
+app.config["SQLALCHEMY_DATABASE_URI"] = raw_db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
+
 with app.app_context():
     db.create_all()
-    print("Tables created")
 
 class Dealership(db.Model):
     __tablename__ = "dealerships"
