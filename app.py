@@ -19,8 +19,10 @@ SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
 app = Flask(__name__)
 CORS(app)
 
-# --- DATABASE SETUP ---
-raw_db_url = os.getenv("DATABASE_URL", "sqlite:///star4ce.db")
+raw_db_url = os.getenv("DATABASE_URL")
+if not raw_db_url:
+    raise RuntimeError("DATABASE_URL is not set – required in production")
+
 if raw_db_url.startswith("postgres://"):
     raw_db_url = raw_db_url.replace("postgres://", "postgresql://", 1)
 
@@ -31,6 +33,8 @@ db = SQLAlchemy(app)
 
 with app.app_context():
     db.create_all()
+    print("✔️ Ensured all DB tables exist")
+
 
 class Dealership(db.Model):
     __tablename__ = "dealerships"
