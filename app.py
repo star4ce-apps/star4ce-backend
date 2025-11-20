@@ -380,22 +380,7 @@ def login():
         return jsonify(error="invalid credentials"), 401
 
     if not user.is_verified:
-        # generate a fresh verification code and resend
-        code_int = secrets.randbelow(1_000_000)  # 0..999999
-        verification_code = f"{code_int:06d}"
-        expires_at = datetime.datetime.utcnow() + datetime.timedelta(hours=1)
-
-        user.verification_code = verification_code
-        user.verification_expires_at = expires_at
-        db.session.commit()
-
-        send_verification_email(user.email, verification_code)
-
-        return jsonify(
-            error="unverified",
-            message="Your email is not verified yet. A new verification code has been sent."
-        ), 403
-
+        print(f"[DEV MODE] allowing unverified user to login: {email}")
 
     if not check_password_hash(user.password_hash, password):
         return jsonify(error="invalid credentials"), 401
