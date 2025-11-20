@@ -21,8 +21,6 @@ CORS(app)
 
 # --- DATABASE SETUP ---
 raw_db_url = os.getenv("DATABASE_URL", "sqlite:///star4ce.db")
-
-# Render / Heroku format fix
 if raw_db_url.startswith("postgres://"):
     raw_db_url = raw_db_url.replace("postgres://", "postgresql://", 1)
 
