@@ -31,11 +31,6 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
 
-with app.app_context():
-    db.create_all()
-    print("✔️ Ensured all DB tables exist")
-
-
 class Dealership(db.Model):
     __tablename__ = "dealerships"
 
