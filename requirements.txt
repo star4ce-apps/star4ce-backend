@@ -4,3 +4,4 @@ gunicorn
 PyJWT
 python-dotenv
 flask_sqlalchemy
+psycopg2
