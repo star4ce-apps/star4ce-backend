@@ -20,18 +20,18 @@ app = Flask(__name__)
 CORS(app)
 
 # Dev: uses local SQLite file "star4ce.db"
-# app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv(
-#     "DATABASE_URL",
-#     "sqlite:///star4ce.db"
-# )
+app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv(
+    "DATABASE_URL",
+    "sqlite:///star4ce.db"
+)
 #######
 
 # Prod later: set DATABASE_URL in env to use Postgres on Render.
-db_url = os.getenv("DATABASE_URL")
-if not db_url:
-    raise RuntimeError("DATABASE_URL is not set – required in production")
+# db_url = os.getenv("DATABASE_URL")
+# if not db_url:
+#     raise RuntimeError("DATABASE_URL is not set – required in production")
 
-app.config["SQLALCHEMY_DATABASE_URI"] = db_url
+# app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 ######
 
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
