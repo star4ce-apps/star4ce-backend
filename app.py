@@ -19,10 +19,12 @@ SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
 app = Flask(__name__)
 CORS(app)
 
-raw_db_url = os.getenv("DATABASE_URL")
-if not raw_db_url:
-    raise RuntimeError("DATABASE_URL is not set – required in production")
+# --- DATABASE SETUP ---
 
+# Get DATABASE_URL from Render (or fall back to local sqlite when running locally)
+raw_db_url = os.getenv("DATABASE_URL", "sqlite:///star4ce.db")
+
+# Render / Heroku sometimes give postgres://, SQLAlchemy needs postgresql://
 if raw_db_url.startswith("postgres://"):
     raw_db_url = raw_db_url.replace("postgres://", "postgresql://", 1)
 
@@ -930,6 +932,11 @@ def submit_survey():
 
     return jsonify(ok=True, id=resp.id)
 
+
+# --- Ensure DB tables exist on startup (Render + local) ---
+with app.app_context():
+    db.create_all()
+    print("✔️ Ensured all DB tables exist in", db.engine.url)
 
 if __name__ == "__main__":
     app.run(debug=True)
