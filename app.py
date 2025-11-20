@@ -1,4 +1,4 @@
-﻿import os, datetime, jwt, smtplib, secrets, json, random
+﻿import os, datetime, jwt, smtplib, secrets, json, random, requests
 from email.message import EmailMessage
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -15,6 +15,9 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
+
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+EMAIL_FROM = os.getenv("EMAIL_FROM", SMTP_FROM or SMTP_USER)
 
 app = Flask(__name__)
 CORS(app)
@@ -209,17 +212,15 @@ def get_current_user():
     return user, None
 
 def send_verification_email(to_email: str, code: str):
-  """
-  Sends a simple verification email with a 6-digit code.
-  Uses Gmail SMTP settings from .env.
-  """
-  if not (SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASSWORD and SMTP_FROM):
-      # In dev, just print so we don't crash if SMTP is not configured right
-      print(f"[DEV] Would send verification code {code} to {to_email}")
-      return
+    """
+    Sends a verification email with a 6-digit code.
 
-  subject = "Star4ce – Verify your email"
-  body = f"""Hello,
+    - In all environments, logs the code for debugging.
+    - If RESEND_API_KEY is set, uses Resend HTTP API (good for Render).
+    - Otherwise falls back to SMTP (useful for local dev).
+    """
+    subject = "Star4ce – Verify your email"
+    body = f"""Hello,
 
 Thank you for registering with Star4ce.
 
@@ -232,21 +233,67 @@ If you did not request this, you can ignore this email.
 – Star4ce
 """
 
-  msg = EmailMessage()
-  msg["Subject"] = subject
-  msg["From"] = SMTP_FROM
-  msg["To"] = to_email
-  msg.set_content(body)
+    # Always log so you can read the code in Render logs if needed
+    print(f"[EMAIL DEBUG] Verification code for {to_email}: {code}", flush=True)
 
-  try:
-      with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-          server.starttls()
-          server.login(SMTP_USER, SMTP_PASSWORD)
-          server.send_message(msg)
-      print(f"[EMAIL] Sent verification email to {to_email}")
-  except Exception as e:
-      # Don't crash the app if email sending fails; just log it in dev
-      print(f"[EMAIL ERROR] Could not send verification email to {to_email}: {e}")
+    # ---- Preferred: Resend HTTP API (works well on Render) ----
+    if RESEND_API_KEY and EMAIL_FROM:
+        try:
+            resp = requests.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": f"Bearer {RESEND_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "from": EMAIL_FROM,
+                    "to": [to_email],
+                    "subject": subject,
+                    "text": body,
+                },
+                timeout=10,
+            )
+            if resp.status_code >= 400:
+                print(
+                    f"[EMAIL ERROR] Resend API error {resp.status_code}: {resp.text}",
+                    flush=True,
+                )
+            else:
+                print(f"[EMAIL] Sent verification email via Resend to {to_email}",
+                      flush=True)
+            return
+        except Exception as e:
+            print(f"[EMAIL ERROR] Resend exception for {to_email}: {e}", flush=True)
+            # fall through to SMTP/local if available
+
+    # ---- Fallback: SMTP (mostly for local dev) ----
+    if not (SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASSWORD and EMAIL_FROM):
+        print(
+            "[EMAIL WARN] No email provider configured, "
+            "skipping actual send (code is in logs).",
+            flush=True,
+        )
+        return
+
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = EMAIL_FROM
+        msg["To"] = to_email
+        msg.set_content(body)
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+
+        print(f"[EMAIL] Sent verification email via SMTP to {to_email}", flush=True)
+    except Exception as e:
+        print(
+            f"[EMAIL ERROR] Could not send verification email via SMTP "
+            f"to {to_email}: {e}",
+            flush=True,
+        )
 
 def send_verified_email(to_email: str):
     """
@@ -380,7 +427,21 @@ def login():
         return jsonify(error="invalid credentials"), 401
 
     if not user.is_verified:
-        print(f"[DEV MODE] allowing unverified user to login: {email}")
+        # generate a fresh verification code and resend
+        code_int = secrets.randbelow(1_000_000)  # 0..999999
+        verification_code = f"{code_int:06d}"
+        expires_at = datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+
+        user.verification_code = verification_code
+        user.verification_expires_at = expires_at
+        db.session.commit()
+
+        send_verification_email(user.email, verification_code)
+
+        return jsonify(
+            error="unverified",
+            message="Your email is not verified yet. A new verification code has been sent."
+        ), 403
 
     if not check_password_hash(user.password_hash, password):
         return jsonify(error="invalid credentials"), 401
