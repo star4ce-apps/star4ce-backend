@@ -24,6 +24,10 @@ STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID")  # Monthly subscription price ID
 
+# Set Stripe API key if available
+if STRIPE_AVAILABLE and STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
+
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER")
@@ -1767,6 +1771,54 @@ def get_subscription_status():
     if not dealership:
         return jsonify(error="dealership not found"), 404
 
+    # Sync with Stripe if we have a customer ID (in case webhook didn't fire)
+    if STRIPE_AVAILABLE and STRIPE_SECRET_KEY and dealership.stripe_customer_id:
+        try:
+            # Check for active subscriptions in Stripe
+            subscriptions = stripe.Subscription.list(
+                customer=dealership.stripe_customer_id,
+                status="active",
+                limit=1
+            )
+            
+            if subscriptions.data:
+                # Found active subscription in Stripe - sync database
+                active_sub = subscriptions.data[0]
+                if dealership.subscription_status != "active" or dealership.stripe_subscription_id != active_sub.id:
+                    print(f"[SYNC] Syncing subscription status from Stripe for customer {dealership.stripe_customer_id}", flush=True)
+                    dealership.subscription_status = "active"
+                    dealership.stripe_subscription_id = active_sub.id
+                    dealership.subscription_plan = "pro"
+                    current_period_end = active_sub.get("current_period_end")
+                    if current_period_end:
+                        dealership.subscription_ends_at = datetime.datetime.fromtimestamp(current_period_end)
+                    db.session.commit()
+            elif dealership.subscription_status == "active":
+                # Database says active but Stripe says no active subscription - check all statuses
+                all_subs = stripe.Subscription.list(customer=dealership.stripe_customer_id, limit=10)
+                if all_subs.data:
+                    # Get the most recent subscription
+                    latest_sub = sorted(all_subs.data, key=lambda x: x.created, reverse=True)[0]
+                    status_map = {
+                        "active": "active",
+                        "trialing": "active",
+                        "past_due": "active",  # Still active, just needs payment
+                        "canceled": "canceled",
+                        "unpaid": "expired",
+                        "incomplete": "expired",
+                        "incomplete_expired": "expired",
+                    }
+                    mapped_status = status_map.get(latest_sub.status, "expired")
+                    dealership.subscription_status = mapped_status
+                    dealership.stripe_subscription_id = latest_sub.id
+                    current_period_end = latest_sub.get("current_period_end")
+                    if current_period_end:
+                        dealership.subscription_ends_at = datetime.datetime.fromtimestamp(current_period_end)
+                    db.session.commit()
+        except Exception as e:
+            # If Stripe check fails, just use database value
+            print(f"[SYNC] Failed to sync with Stripe: {e}", flush=True)
+
     return jsonify(
         ok=True,
         subscription_status=dealership.subscription_status,
@@ -1808,14 +1860,40 @@ def create_checkout_session():
             dealership = Dealership.query.get(dealership_id)
             if dealership and dealership.stripe_customer_id:
                 customer_id = dealership.stripe_customer_id
+                # Verify customer exists in Stripe
+                try:
+                    stripe.Customer.retrieve(customer_id)
+                except stripe._error.InvalidRequestError as e:
+                    # Customer doesn't exist in Stripe, clear it from database
+                    if "No such customer" in str(e):
+                        print(f"[STRIPE] Customer {customer_id} not found in Stripe, creating new customer", flush=True)
+                        customer_id = None
+                        if dealership:
+                            dealership.stripe_customer_id = None
+                            db.session.commit()
+                    else:
+                        raise
+                except Exception as e:
+                    # Other Stripe errors - log and try to create new customer
+                    print(f"[STRIPE] Error retrieving customer {customer_id}: {e}, creating new customer", flush=True)
+                    customer_id = None
+                    if dealership:
+                        dealership.stripe_customer_id = None
+                        db.session.commit()
         
         if not customer_id:
             # Create new Stripe customer
-            customer = stripe.Customer.create(
-                email=user.email,
-                metadata={"user_id": user.id, "dealership_id": str(dealership_id) if dealership_id else "new"}
-            )
-            customer_id = customer.id
+            try:
+                customer = stripe.Customer.create(
+                    email=user.email,
+                    metadata={"user_id": user.id, "dealership_id": str(dealership_id) if dealership_id else "new"}
+                )
+                customer_id = customer.id
+            except AttributeError as ae:
+                # Handle Python 3.14 compatibility issue with Stripe
+                if "'NoneType' object has no attribute 'Secret'" in str(ae):
+                    raise Exception("Stripe library compatibility issue. Please use Python 3.11 or 3.12, or update Stripe library.")
+                raise
             
             # Save customer ID if dealership exists
             if dealership_id:
@@ -1825,30 +1903,118 @@ def create_checkout_session():
                     db.session.commit()
 
         # Create checkout session
-        checkout_session = stripe.checkout.Session.create(
-            customer=customer_id,
-            payment_method_types=["card"],
-            line_items=[{
-                "price": STRIPE_PRICE_ID,
-                "quantity": 1,
-            }],
-            mode="subscription",
-            success_url=f"{FRONTEND_URL}/dashboard?subscription=success",
-            cancel_url=f"{FRONTEND_URL}/dashboard?subscription=canceled",
-            metadata={
-                "user_id": user.id,
-                "dealership_id": str(dealership_id) if dealership_id else "new",
-                "user_email": user.email
-            },
-        )
+        # Ensure we have a valid customer_id
+        if not customer_id:
+            # This should not happen, but safety check
+            print(f"[STRIPE ERROR] No customer_id available for checkout", flush=True)
+            return jsonify(error="Failed to create customer for checkout"), 500
+        
+        try:
+            checkout_session = stripe.checkout.Session.create(
+                customer=customer_id,
+                payment_method_types=["card"],
+                line_items=[{
+                    "price": STRIPE_PRICE_ID,
+                    "quantity": 1,
+                }],
+                mode="subscription",
+                success_url=f"{FRONTEND_URL}/dashboard?subscription=success",
+                cancel_url=f"{FRONTEND_URL}/dashboard?subscription=canceled",
+                metadata={
+                    "user_id": user.id,
+                    "dealership_id": str(dealership_id) if dealership_id else "new",
+                    "user_email": user.email
+                },
+            )
+        except stripe._error.InvalidRequestError as e:
+            # If customer doesn't exist, create a new one and retry
+            if "No such customer" in str(e) and customer_id:
+                print(f"[STRIPE] Customer {customer_id} invalid in checkout, creating new customer", flush=True)
+                # Clear invalid customer ID
+                if dealership_id:
+                    dealership = Dealership.query.get(dealership_id)
+                    if dealership:
+                        dealership.stripe_customer_id = None
+                        db.session.commit()
+                
+                # Create new customer
+                try:
+                    customer = stripe.Customer.create(
+                        email=user.email,
+                        metadata={"user_id": user.id, "dealership_id": str(dealership_id) if dealership_id else "new"}
+                    )
+                    customer_id = customer.id
+                    
+                    # Save new customer ID
+                    if dealership_id:
+                        dealership = Dealership.query.get(dealership_id)
+                        if dealership:
+                            dealership.stripe_customer_id = customer_id
+                            db.session.commit()
+                    
+                    # Retry checkout session creation
+                    checkout_session = stripe.checkout.Session.create(
+                        customer=customer_id,
+                        payment_method_types=["card"],
+                        line_items=[{
+                            "price": STRIPE_PRICE_ID,
+                            "quantity": 1,
+                        }],
+                        mode="subscription",
+                        success_url=f"{FRONTEND_URL}/dashboard?subscription=success",
+                        cancel_url=f"{FRONTEND_URL}/dashboard?subscription=canceled",
+                        metadata={
+                            "user_id": user.id,
+                            "dealership_id": str(dealership_id) if dealership_id else "new",
+                            "user_email": user.email
+                        },
+                    )
+                except Exception as retry_err:
+                    error_msg = str(retry_err)
+                    print(f"[STRIPE ERROR] Failed to create customer/checkout on retry: {error_msg}", flush=True)
+                    import traceback
+                    traceback.print_exc()
+                    if os.getenv("ENVIRONMENT") != "production":
+                        return jsonify(error=f"Failed to create checkout session: {error_msg}"), 500
+                    return jsonify(error="Failed to create checkout session"), 500
+            else:
+                # Other InvalidRequestError - re-raise
+                error_msg = str(e)
+                print(f"[STRIPE ERROR] Checkout creation failed: {error_msg}", flush=True)
+                import traceback
+                traceback.print_exc()
+                if os.getenv("ENVIRONMENT") != "production":
+                    return jsonify(error=f"Failed to create checkout session: {error_msg}"), 500
+                return jsonify(error="Failed to create checkout session"), 500
+        except AttributeError as ae:
+            # Handle Python 3.14 compatibility issue with Stripe
+            if "'NoneType' object has no attribute 'Secret'" in str(ae):
+                raise Exception("Stripe library has a compatibility issue with Python 3.14. Please downgrade to Python 3.11 or 3.12, or wait for Stripe library update.")
+            raise
 
         return jsonify(
             ok=True,
             checkout_url=checkout_session.url,
             session_id=checkout_session.id,
         )
+    except stripe._error.StripeError as e:
+        # Catch all Stripe-specific errors
+        error_msg = str(e)
+        print(f"[STRIPE ERROR] Checkout creation failed: {error_msg}", flush=True)
+        import traceback
+        traceback.print_exc()
+        # Return more detailed error in development
+        if os.getenv("ENVIRONMENT") != "production":
+            return jsonify(error=f"Failed to create checkout session: {error_msg}"), 500
+        return jsonify(error="Failed to create checkout session"), 500
     except Exception as e:
-        print(f"[STRIPE ERROR] Checkout creation failed: {e}", flush=True)
+        error_msg = str(e)
+        print(f"[ERROR] Unexpected error in checkout creation: {error_msg}", flush=True)
+        import traceback
+        traceback.print_exc()
+        # Return more detailed error in development
+        if os.getenv("ENVIRONMENT") != "production":
+            return jsonify(error=f"Failed to create checkout session: {error_msg}"), 500
         return jsonify(error="Failed to create checkout session"), 500
 
 @app.post("/subscription/webhook")
@@ -1866,7 +2032,7 @@ def stripe_webhook():
         )
     except ValueError:
         return jsonify(error="Invalid payload"), 400
-    except stripe.error.SignatureVerificationError:
+    except stripe._error.SignatureVerificationError:
         return jsonify(error="Invalid signature"), 400
 
     # Handle the event
@@ -1905,6 +2071,10 @@ def handle_checkout_completed(session):
         if dealership_id_str and dealership_id_str != "new":
             dealership = Dealership.query.get(int(dealership_id_str))
         
+        # Also check if user already has a dealership (for resubscriptions)
+        if not dealership and user.dealership_id:
+            dealership = Dealership.query.get(user.dealership_id)
+        
         if not dealership:
             # Create new dealership for this user
             dealership = Dealership(
@@ -1916,18 +2086,28 @@ def handle_checkout_completed(session):
             db.session.add(dealership)
             db.session.flush()  # Get the ID
         
-        # Update dealership subscription info
+        # Update dealership subscription info (important for resubscriptions)
         subscription_id = session.get("subscription")
         if subscription_id:
             dealership.stripe_subscription_id = subscription_id
-            dealership.subscription_status = "active"
+            dealership.subscription_status = "active"  # Always set to active on new payment
             dealership.subscription_plan = "pro"
-            # Set subscription end date (1 month from now, Stripe will renew)
-            dealership.subscription_ends_at = datetime.datetime.utcnow() + datetime.timedelta(days=30)
+            # Get actual period end from Stripe subscription if available
+            try:
+                sub = stripe.Subscription.retrieve(subscription_id)
+                period_end = sub.get("current_period_end")
+                if period_end:
+                    dealership.subscription_ends_at = datetime.datetime.fromtimestamp(period_end)
+                else:
+                    # Fallback: 1 month from now
+                    dealership.subscription_ends_at = datetime.datetime.utcnow() + datetime.timedelta(days=30)
+            except:
+                # Fallback: 1 month from now if we can't retrieve from Stripe
+                dealership.subscription_ends_at = datetime.datetime.utcnow() + datetime.timedelta(days=30)
         
         # Update Stripe customer ID if not set
         customer_id = session.get("customer")
-        if customer_id and not dealership.stripe_customer_id:
+        if customer_id:
             dealership.stripe_customer_id = customer_id
 
         # Upgrade user to admin and assign to dealership
@@ -1978,6 +2158,80 @@ def handle_subscription_deleted(subscription):
     except Exception as e:
         print(f"[WEBHOOK ERROR] Subscription deleted handler failed: {e}", flush=True)
 
+@app.post("/subscription/cancel")
+@limiter.limit("5 per hour")
+def cancel_subscription():
+    """Cancel the user's subscription"""
+    user, err = get_current_user()
+    if err:
+        return err
+    
+    if not STRIPE_AVAILABLE or not STRIPE_SECRET_KEY:
+        return jsonify(error="Stripe not configured"), 503
+    
+    if not user.dealership_id:
+        return jsonify(error="No subscription found"), 404
+    
+    dealership = Dealership.query.get(user.dealership_id)
+    if not dealership:
+        return jsonify(error="Dealership not found"), 404
+    
+    if not dealership.stripe_subscription_id:
+        # No Stripe subscription, just update database
+        dealership.subscription_status = "canceled"
+        db.session.commit()
+        return jsonify(ok=True, message="Subscription canceled")
+    
+    try:
+        # Cancel subscription in Stripe
+        subscription = stripe.Subscription.retrieve(dealership.stripe_subscription_id)
+        
+        if subscription.status == "canceled":
+            # Already canceled, just update database
+            dealership.subscription_status = "canceled"
+            db.session.commit()
+            return jsonify(ok=True, message="Subscription already canceled")
+        
+        # Cancel immediately (or use cancel_at_period_end=True to cancel at period end)
+        data = request.get_json(silent=True) or {}
+        cancel_at_period_end = data.get("cancel_at_period_end", False)
+        
+        if cancel_at_period_end:
+            # Cancel at period end - modify subscription
+            canceled_sub = stripe.Subscription.modify(
+                dealership.stripe_subscription_id,
+                cancel_at_period_end=True
+            )
+            # Still active until period end
+            dealership.subscription_status = "active"
+            period_end = canceled_sub.get("current_period_end")
+            if period_end:
+                dealership.subscription_ends_at = datetime.datetime.fromtimestamp(period_end)
+            db.session.commit()
+            return jsonify(ok=True, message="Subscription will be canceled at the end of the billing period", subscription_status=dealership.subscription_status)
+        else:
+            # Cancel immediately - delete subscription
+            canceled_sub = stripe.Subscription.delete(dealership.stripe_subscription_id)
+            # Update database immediately
+            dealership.subscription_status = "canceled"
+            dealership.subscription_ends_at = datetime.datetime.utcnow()  # Set to now for immediate effect
+            db.session.commit()
+            return jsonify(ok=True, message="Subscription canceled immediately", subscription_status=dealership.subscription_status)
+        
+    except stripe._error.InvalidRequestError as e:
+        print(f"[STRIPE ERROR] Cancel subscription failed: {e}", flush=True)
+        # If subscription not found in Stripe, just update database
+        if "No such subscription" in str(e):
+            dealership.subscription_status = "canceled"
+            db.session.commit()
+            return jsonify(ok=True, message="Subscription canceled (not found in Stripe)")
+        return jsonify(error=f"Failed to cancel subscription: {str(e)}"), 500
+    except Exception as e:
+        print(f"[ERROR] Cancel subscription failed: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify(error="Failed to cancel subscription"), 500
+
 @app.get("/subscription/check-limits")
 @limiter.limit("30 per minute")
 def check_subscription_limits():
@@ -2024,7 +2278,7 @@ def check_subscription_limits():
 # --- Ensure DB tables exist on startup (Render + local) ---
 with app.app_context():
     db.create_all()
-    print("✔️ Ensured all DB tables exist in", db.engine.url)
+    print("[OK] Ensured all DB tables exist in", db.engine.url)
 
 if __name__ == "__main__":
     # For local development only
