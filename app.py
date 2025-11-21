@@ -126,7 +126,24 @@ class Dealership(db.Model):
             "city": self.city,
             "state": self.state,
             "zip_code": self.zip_code,
+            "subscription_status": self.subscription_status,
+            "subscription_plan": self.subscription_plan,
+            "trial_ends_at": self.trial_ends_at.isoformat() + "Z" if self.trial_ends_at else None,
+            "subscription_ends_at": self.subscription_ends_at.isoformat() + "Z" if self.subscription_ends_at else None,
         }
+
+    def is_subscription_active(self) -> bool:
+        """Check if subscription is active (trial or paid)"""
+        if self.subscription_status == "trial":
+            return self.trial_ends_at and self.trial_ends_at > datetime.datetime.utcnow()
+        return self.subscription_status == "active"
+
+    def days_remaining_in_trial(self) -> int:
+        """Get days remaining in trial period"""
+        if self.subscription_status == "trial" and self.trial_ends_at:
+            remaining = self.trial_ends_at - datetime.datetime.utcnow()
+            return max(0, remaining.days)
+        return 0
 
 
 class User(db.Model):
@@ -1126,94 +1143,109 @@ def create_access_code():
     Creates a new survey access code for the admin's dealership.
     If admin doesn't have a dealership, creates one automatically.
     """
-    user, err = get_current_user()
-    if err:
-        return err  # 401 / 403
+    try:
+        user, err = get_current_user()
+        if err:
+            return err  # 401 / 403
 
-    # Must be an admin with a dealership
-    if user.role != "admin":
-        return jsonify(error="only admins can create survey access codes"), 403
+        # Must be an admin with a dealership
+        if user.role != "admin":
+            return jsonify(error="only admins can create survey access codes"), 403
 
-    # Check subscription limits
-    if user.dealership_id:
-        dealership = Dealership.query.get(user.dealership_id)
-        if dealership and not dealership.is_subscription_active():
-            return jsonify(
-                error="subscription_expired",
-                message="Your subscription has expired. Please renew to create access codes."
-            ), 403
+        # Check subscription limits
+        if user.dealership_id:
+            dealership = Dealership.query.get(user.dealership_id)
+            if dealership and not dealership.is_subscription_active():
+                return jsonify(
+                    error="subscription_expired",
+                    message="Your subscription has expired. Please renew to create access codes."
+                ), 403
 
-    # If admin doesn't have a dealership, create one automatically
-    if not user.dealership_id:
-        # Create a default dealership for this admin with 14-day trial
-        dealership = Dealership(
-            name=f"Dealership for {user.email}",
-            address=None,
-            subscription_status="trial",
-            trial_ends_at=datetime.datetime.utcnow() + datetime.timedelta(days=14),
-            city=None,
-            state=None,
-            zip_code=None,
-        )
-        db.session.add(dealership)
-        db.session.flush()  # Get the ID without committing
-        
-        # Assign the dealership to the admin
-        user.dealership_id = dealership.id
-        db.session.commit()
-    else:
-        # Ensure the dealership still exists
-        dealership = Dealership.query.get(user.dealership_id)
-        if not dealership:
-            # Dealership was deleted, create a new one
+        # If admin doesn't have a dealership, create one automatically
+        if not user.dealership_id:
+            # Create a default dealership for this admin with 14-day trial
+            now = datetime.datetime.utcnow()
             dealership = Dealership(
                 name=f"Dealership for {user.email}",
                 address=None,
+                subscription_status="trial",
+                trial_ends_at=now + datetime.timedelta(days=14),
                 city=None,
                 state=None,
                 zip_code=None,
+                created_at=now,
+                updated_at=now,
             )
             db.session.add(dealership)
-            db.session.flush()
+            db.session.flush()  # Get the ID without committing
+            
+            # Assign the dealership to the admin
             user.dealership_id = dealership.id
             db.session.commit()
+        else:
+            # Ensure the dealership still exists
+            dealership = Dealership.query.get(user.dealership_id)
+            if not dealership:
+                # Dealership was deleted, create a new one
+                now = datetime.datetime.utcnow()
+                dealership = Dealership(
+                    name=f"Dealership for {user.email}",
+                    address=None,
+                    city=None,
+                    state=None,
+                    zip_code=None,
+                    subscription_status="trial",
+                    trial_ends_at=now + datetime.timedelta(days=14),
+                    created_at=now,
+                    updated_at=now,
+                )
+                db.session.add(dealership)
+                db.session.flush()
+                user.dealership_id = dealership.id
+                db.session.commit()
 
-    # Optional: read an expiry from the request body (in hours), else None
-    data = request.get_json(silent=True) or {}
-    hours = data.get("expires_in_hours")
-    expires_at = None
-    if isinstance(hours, (int, float)) and hours > 0:
-        expires_at = datetime.datetime.utcnow() + datetime.timedelta(hours=hours)
+        # Optional: read an expiry from the request body (in hours), else None
+        data = request.get_json(silent=True) or {}
+        hours = data.get("expires_in_hours")
+        expires_at = None
+        if isinstance(hours, (int, float)) and hours > 0:
+            expires_at = datetime.datetime.utcnow() + datetime.timedelta(hours=hours)
 
-    code = generate_access_code()
+        code = generate_access_code()
 
-    access = SurveyAccessCode(
-        code=code,
-        dealership_id=user.dealership_id,
-        expires_at=expires_at,
-        is_active=True,
-    )
-    db.session.add(access)
-    db.session.commit()
+        access = SurveyAccessCode(
+            code=code,
+            dealership_id=user.dealership_id,
+            expires_at=expires_at,
+            is_active=True,
+        )
+        db.session.add(access)
+        db.session.commit()
 
-    # Log admin action
-    log_admin_action(
-        user.email,
-        "create_access_code",
-        "access_code",
-        access.id,
-        json.dumps({"code": access.code, "expires_at": access.expires_at.isoformat() + "Z" if access.expires_at else None})
-    )
+        # Log admin action
+        log_admin_action(
+            user.email,
+            "create_access_code",
+            "access_code",
+            access.id,
+            json.dumps({"code": access.code, "expires_at": access.expires_at.isoformat() + "Z" if access.expires_at else None})
+        )
 
-    return jsonify(
-        ok=True,
-        id=access.id,
-        code=access.code,
-        dealership_id=access.dealership_id,
-        created_at=access.created_at.isoformat() + "Z",
-        expires_at=access.expires_at.isoformat() + "Z" if access.expires_at else None,
-        is_active=access.is_active,
-    )
+        return jsonify(
+            ok=True,
+            id=access.id,
+            code=access.code,
+            dealership_id=access.dealership_id,
+            created_at=access.created_at.isoformat() + "Z",
+            expires_at=access.expires_at.isoformat() + "Z" if access.expires_at else None,
+            is_active=access.is_active,
+        )
+    except Exception as e:
+        print(f"[CREATE ACCESS CODE ERROR] {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        db.session.rollback()
+        return jsonify(error=f"Failed to create access code: {str(e)}"), 500
 
 @app.get("/survey/access-codes")
 def list_access_codes():
