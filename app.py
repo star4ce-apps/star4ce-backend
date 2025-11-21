@@ -1,4 +1,6 @@
 ﻿import os, datetime, jwt, smtplib, secrets, json, random, requests
+import csv
+import io
 try:
     import stripe
     STRIPE_AVAILABLE = True
@@ -6,7 +8,7 @@ except ImportError:
     STRIPE_AVAILABLE = False
     stripe = None
 from email.message import EmailMessage
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from flask_limiter import Limiter
@@ -294,9 +296,54 @@ class SurveyResponse(db.Model):
             "created_at": self.created_at.isoformat() + "Z",
         }
 
+class AdminAuditLog(db.Model):
+    __tablename__ = "admin_audit_logs"
+
+    id = db.Column(db.Integer, primary_key=True)
+    admin_email = db.Column(db.String(255), nullable=False)
+    action = db.Column(db.String(100), nullable=False)  # e.g., "create_access_code", "update_employee"
+    resource_type = db.Column(db.String(100), nullable=False)  # e.g., "access_code", "employee", "dealership"
+    resource_id = db.Column(db.Integer, nullable=True)  # ID of the resource that was acted upon
+    details = db.Column(db.Text, nullable=True)  # JSON string with additional details
+    ip_address = db.Column(db.String(45), nullable=True)  # IPv4 or IPv6 address
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "admin_email": self.admin_email,
+            "action": self.action,
+            "resource_type": self.resource_type,
+            "resource_id": self.resource_id,
+            "details": self.details,
+            "ip_address": self.ip_address,
+            "created_at": self.created_at.isoformat() + "Z",
+        }
+
 @app.get("/health")
 def health():
-    return jsonify(ok=True, service="star4ce-backend")
+    """Health check endpoint with system status"""
+    try:
+        # Check database connection
+        db.session.execute(db.text("SELECT 1"))
+        db_status = "connected"
+    except Exception as e:
+        db_status = f"error: {str(e)[:50]}"
+    
+    # Check Stripe
+    stripe_status = "configured" if (STRIPE_AVAILABLE and STRIPE_SECRET_KEY) else "not_configured"
+    
+    # Check email
+    email_status = "configured" if (RESEND_API_KEY or SMTP_USER) else "not_configured"
+    
+    return jsonify(
+        ok=True,
+        service="star4ce-backend",
+        database=db_status,
+        stripe=stripe_status,
+        email=email_status,
+        environment=os.getenv("ENVIRONMENT", "development")
+    )
 
 def make_token(email: str, role: str = "manager"):
     """Create JWT token with reasonable expiration for better UX"""
@@ -362,24 +409,25 @@ def get_current_user():
 def log_admin_action(admin_email: str, action: str, resource_type: str, resource_id: int = None, details: str = None):
     """Log admin actions for audit trail"""
     try:
-        # AdminAuditLog model not yet implemented - log to console for now
-        # TODO: Add AdminAuditLog model when needed
-        ip_address = request.remote_addr
+        ip_address = request.remote_addr if request else None
+        # Log to console for debugging
         print(f"[AUDIT] {admin_email} - {action} - {resource_type} - {resource_id} - IP: {ip_address}", flush=True)
-        # Uncomment when AdminAuditLog model is added:
-        # log_entry = AdminAuditLog(
-        #     admin_email=admin_email,
-        #     action=action,
-        #     resource_type=resource_type,
-        #     resource_id=resource_id,
-        #     details=details,
-        #     ip_address=ip_address,
-        # )
-        # db.session.add(log_entry)
-        # db.session.commit()
+        
+        # Save to database
+        log_entry = AdminAuditLog(
+            admin_email=admin_email,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            details=details,
+            ip_address=ip_address,
+        )
+        db.session.add(log_entry)
+        db.session.commit()
     except Exception as e:
         # Don't fail the request if logging fails
         print(f"[AUDIT ERROR] Failed to log action: {e}", flush=True)
+        db.session.rollback()
 
 def send_email_via_resend_or_smtp(to_email: str, subject: str, body: str):
     """
@@ -474,8 +522,9 @@ This code expires in 1 hour.
 – Star4ce
 """
 
-    # Always log for debugging (especially useful in Render logs)
-    print(f"[EMAIL DEBUG] Verification code for {to_email}: {code}", flush=True)
+    # Log verification code in development only (for testing)
+    if os.getenv("ENVIRONMENT") != "production":
+        print(f"[EMAIL DEBUG] Verification code for {to_email}: {code}", flush=True)
     
     send_email_via_resend_or_smtp(to_email, subject, body)
 
@@ -524,8 +573,9 @@ If you did not request this, you can ignore this email.
 – Star4ce
 """
 
-    # Log for debugging
-    print(f"[EMAIL DEBUG] Reset code for {to_email}: {code}", flush=True)
+    # Log reset code in development only (for testing)
+    if os.getenv("ENVIRONMENT") != "production":
+        print(f"[EMAIL DEBUG] Reset code for {to_email}: {code}", flush=True)
     
     send_email_via_resend_or_smtp(to_email, subject, body)
 
@@ -561,6 +611,15 @@ def validate_email(email: str) -> bool:
     pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
     return bool(re.match(pattern, email))
 
+def validate_phone(phone: str) -> bool:
+    """Validate phone number format (basic validation)"""
+    if not phone:
+        return True  # Phone is optional
+    # Remove common formatting characters
+    cleaned = re.sub(r'[\s\-\(\)\.]', '', phone)
+    # Check if it's all digits and reasonable length (10-15 digits)
+    return cleaned.isdigit() and 10 <= len(cleaned) <= 15
+
 def validate_password(password: str) -> bool:
     """Validate password strength"""
     if len(password) < 8:
@@ -579,6 +638,44 @@ def sanitize_input(text: str, max_length: int = 255) -> str:
     # Trim and limit length
     return text.strip()[:max_length]
 
+def generate_csv_response(data: list, filename: str) -> Response:
+    """Generate CSV response from list of dictionaries"""
+    if not data:
+        # Return empty CSV with headers
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["No data available"])
+        output.seek(0)
+        response = Response(output.getvalue(), mimetype='text/csv')
+        response.headers['Content-Disposition'] = f'attachment; filename={filename}'
+        return response
+    
+    # Get headers from first row
+    headers = list(data[0].keys())
+    
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=headers)
+    writer.writeheader()
+    
+    for row in data:
+        # Convert any complex types to strings
+        clean_row = {}
+        for key, value in row.items():
+            if value is None:
+                clean_row[key] = ""
+            elif isinstance(value, (dict, list)):
+                clean_row[key] = json.dumps(value)
+            elif isinstance(value, datetime.datetime):
+                clean_row[key] = value.isoformat()
+            else:
+                clean_row[key] = str(value)
+        writer.writerow(clean_row)
+    
+    output.seek(0)
+    response = Response(output.getvalue(), mimetype='text/csv')
+    response.headers['Content-Disposition'] = f'attachment; filename={filename}'
+    return response
+
 # ---- AUTH STUB (no DB yet) ----
 @app.post("/auth/login")
 @limiter.limit("5 per minute")
@@ -588,10 +685,10 @@ def login():
     password = data.get("password") or ""
 
     if not email or not password:
-        return jsonify(error="email and password required"), 400
+        return jsonify(error="Please enter both email and password"), 400
     
     if not validate_email(email):
-        return jsonify(error="invalid email format"), 400
+        return jsonify(error="Please enter a valid email address"), 400
 
     
 
@@ -642,17 +739,17 @@ def register():
     password = data.get("password") or ""
 
     if not email or not password:
-        return jsonify(error="email and password required"), 400
-
+        return jsonify(error="Please enter both email and password"), 400
+    
     if not validate_email(email):
-        return jsonify(error="invalid email format"), 400
+        return jsonify(error="Please enter a valid email address"), 400
 
     if not validate_password(password):
-        return jsonify(error="password must be at least 8 characters with letters and numbers"), 400
+        return jsonify(error="Password must be at least 8 characters and include both letters and numbers"), 400
 
     existing = User.query.filter_by(email=email).first()
     if existing:
-        return jsonify(error="email is already registered"), 400
+        return jsonify(error="This email is already registered. Please sign in instead."), 400
 
     # Public registration ALWAYS creates a manager.
     # Admin / corporate accounts will be created/updated internally only.
@@ -988,6 +1085,246 @@ def analytics_summary():
         traceback.print_exc()
         return jsonify(error=f"Internal server error: {str(e)}"), 500
 
+@app.get("/audit-logs")
+@limiter.limit("30 per minute")
+def get_audit_logs():
+    """
+    Protected endpoint to retrieve admin audit logs.
+    
+    - Only verified 'admin' or 'corporate' users can access
+    - 'admin' sees logs for their dealership only (via user email matching)
+    - 'corporate' sees all audit logs across all dealerships
+    
+    Query parameters:
+    - limit: Maximum number of logs to return (default: 100, max: 500)
+    - offset: Number of logs to skip for pagination (default: 0)
+    - action: Filter by action type (optional)
+    - resource_type: Filter by resource type (optional)
+    """
+    try:
+        user, err = get_current_user()
+        if err:
+            return err  # 401 / 403
+
+        if user.role not in ("admin", "corporate"):
+            return jsonify(error="forbidden – insufficient role"), 403
+
+        # Get query parameters
+        limit = min(int(request.args.get("limit", 100)), 500)  # Max 500
+        offset = int(request.args.get("offset", 0))
+        action_filter = request.args.get("action")
+        resource_type_filter = request.args.get("resource_type")
+
+        # Build query
+        if user.role == "corporate":
+            # Corporate sees all logs
+            query = AdminAuditLog.query
+        else:
+            # Admin sees only their own actions (by email)
+            query = AdminAuditLog.query.filter_by(admin_email=user.email)
+
+        # Apply filters
+        if action_filter:
+            query = query.filter_by(action=action_filter)
+        if resource_type_filter:
+            query = query.filter_by(resource_type=resource_type_filter)
+
+        # Order by most recent first
+        query = query.order_by(AdminAuditLog.created_at.desc())
+
+        # Get total count before pagination
+        total_count = query.count()
+
+        # Apply pagination
+        logs = query.limit(limit).offset(offset).all()
+
+        return jsonify(
+            ok=True,
+            logs=[log.to_dict() for log in logs],
+            total=total_count,
+            limit=limit,
+            offset=offset,
+        )
+    except Exception as e:
+        print(f"[AUDIT LOGS ERROR] Error retrieving audit logs: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify(error=f"Internal server error: {str(e)}"), 500
+
+@app.get("/survey/responses/export")
+@limiter.limit("10 per minute")
+def export_survey_responses():
+    """Admin-only: Export survey responses as CSV"""
+    user, err = get_current_user()
+    if err:
+        return err
+
+    if user.role not in ("admin", "corporate"):
+        return jsonify(error="only admins can export survey responses"), 403
+
+    # Check subscription limits for admin users
+    if user.role == "admin" and user.dealership_id:
+        dealership = Dealership.query.get(user.dealership_id)
+        if dealership and not dealership.is_subscription_active():
+            return jsonify(
+                error="subscription_expired",
+                message="Your subscription has expired. Please renew to export data."
+            ), 403
+
+    # Get date range from query params (optional)
+    days = int(request.args.get("days", 0))  # 0 = all time
+    cutoff = None
+    if days > 0:
+        cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+
+    # Query responses based on role
+    if user.role == "corporate":
+        if cutoff:
+            base_q = SurveyResponse.query.filter(SurveyResponse.created_at >= cutoff)
+        else:
+            base_q = SurveyResponse.query
+    else:
+        if not user.dealership_id:
+            return jsonify(error="admin has no dealership assigned"), 400
+        
+        if cutoff:
+            base_q = (
+                db.session.query(SurveyResponse)
+                .join(SurveyAccessCode, SurveyAccessCode.code == SurveyResponse.access_code)
+                .filter(
+                    SurveyAccessCode.dealership_id == user.dealership_id,
+                    SurveyResponse.created_at >= cutoff
+                )
+            )
+        else:
+            base_q = (
+                db.session.query(SurveyResponse)
+                .join(SurveyAccessCode, SurveyAccessCode.code == SurveyResponse.access_code)
+                .filter(SurveyAccessCode.dealership_id == user.dealership_id)
+            )
+
+    responses = base_q.order_by(SurveyResponse.created_at.desc()).all()
+
+    # Prepare data for CSV
+    csv_data = []
+    for resp in responses:
+        # Flatten satisfaction answers
+        satisfaction_str = ", ".join([f"Q{k}: {v}" for k, v in (resp.satisfaction_answers or {}).items()])
+        training_str = ", ".join([f"Q{k}: {v}" for k, v in (resp.training_answers or {}).items()]) if resp.training_answers else ""
+        
+        csv_data.append({
+            "ID": resp.id,
+            "Access Code": resp.access_code,
+            "Employee Status": resp.employee_status,
+            "Role/Department": resp.role,
+            "Termination Reason": resp.termination_reason or "",
+            "Termination Other": resp.termination_other or "",
+            "Leave Reason": resp.leave_reason or "",
+            "Leave Other": resp.leave_other or "",
+            "Satisfaction Answers": satisfaction_str,
+            "Training Answers": training_str,
+            "Additional Feedback": resp.additional_feedback or "",
+            "Submitted At": resp.created_at.isoformat(),
+        })
+
+    # Generate filename with timestamp
+    timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    filename = f"survey_responses_export_{timestamp}.csv"
+
+    # Log admin action
+    log_admin_action(
+        user.email,
+        "export_survey_responses",
+        "survey_response",
+        None,
+        json.dumps({"count": len(csv_data), "days": days})
+    )
+
+    return generate_csv_response(csv_data, filename)
+
+@app.get("/analytics/export")
+@limiter.limit("10 per minute")
+def export_analytics():
+    """Admin-only: Export analytics summary as CSV"""
+    user, err = get_current_user()
+    if err:
+        return err
+
+    if user.role not in ("admin", "corporate"):
+        return jsonify(error="only admins can export analytics"), 403
+
+    # Check subscription limits for admin users
+    if user.role == "admin" and user.dealership_id:
+        dealership = Dealership.query.get(user.dealership_id)
+        if dealership and not dealership.is_subscription_active():
+            return jsonify(
+                error="subscription_expired",
+                message="Your subscription has expired. Please renew to export data."
+            ), 403
+
+    # Get date range from query params
+    days = int(request.args.get("days", 30))
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+
+    # Query responses based on role
+    if user.role == "corporate":
+        base_q = SurveyResponse.query.filter(SurveyResponse.created_at >= cutoff)
+    else:
+        if not user.dealership_id:
+            return jsonify(error="admin has no dealership assigned"), 400
+        base_q = (
+            db.session.query(SurveyResponse)
+            .join(SurveyAccessCode, SurveyAccessCode.code == SurveyResponse.access_code)
+            .filter(
+                SurveyAccessCode.dealership_id == user.dealership_id,
+                SurveyResponse.created_at >= cutoff
+            )
+        )
+
+    responses = base_q.all()
+
+    # Calculate analytics
+    total_responses = len(responses)
+    status_counts = {"newly-hired": 0, "termination": 0, "leave": 0, "none": 0}
+    role_counts = {}
+    
+    for resp in responses:
+        # Count by status
+        if resp.employee_status in status_counts:
+            status_counts[resp.employee_status] += 1
+        
+        # Count by role
+        role = resp.role or "Unknown"
+        role_counts[role] = role_counts.get(role, 0) + 1
+
+    # Prepare data for CSV
+    csv_data = [
+        {"Metric": "Total Responses", "Value": total_responses, "Period": f"Last {days} days"},
+        {"Metric": "Newly Hired", "Value": status_counts["newly-hired"], "Period": f"Last {days} days"},
+        {"Metric": "Terminations", "Value": status_counts["termination"], "Period": f"Last {days} days"},
+        {"Metric": "Leave", "Value": status_counts["leave"], "Period": f"Last {days} days"},
+        {"Metric": "None", "Value": status_counts["none"], "Period": f"Last {days} days"},
+    ]
+    
+    # Add role breakdown
+    for role, count in sorted(role_counts.items(), key=lambda x: x[1], reverse=True):
+        csv_data.append({"Metric": f"Role: {role}", "Value": count, "Period": f"Last {days} days"})
+
+    # Generate filename with timestamp
+    timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    filename = f"analytics_export_{timestamp}.csv"
+
+    # Log admin action
+    log_admin_action(
+        user.email,
+        "export_analytics",
+        "analytics",
+        None,
+        json.dumps({"days": days, "total_responses": total_responses})
+    )
+
+    return generate_csv_response(csv_data, filename)
+
 @app.post("/auth/verify")
 @limiter.limit("10 per minute")
 def verify_email():
@@ -996,10 +1333,10 @@ def verify_email():
     code = sanitize_input(data.get("code") or "", max_length=6).strip()
     
     if not validate_email(email):
-        return jsonify(error="invalid email format"), 400
+        return jsonify(error="Please enter a valid email address"), 400
 
     if not email or not code:
-        return jsonify(error="email and code required"), 400
+        return jsonify(error="Please enter both email and verification code"), 400
 
     user = User.query.filter_by(email=email).first()
     if not user:
@@ -1009,10 +1346,10 @@ def verify_email():
         return jsonify(ok=True, message="Already verified")
 
     if user.verification_code != code:
-        return jsonify(error="Invalid code"), 400
+        return jsonify(error="Invalid verification code. Please check and try again."), 400
 
     if user.verification_expires_at and user.verification_expires_at < datetime.datetime.utcnow():
-        return jsonify(error="Code expired"), 400
+        return jsonify(error="Verification code has expired. Please request a new one."), 400
 
     user.is_verified = True
     user.verification_code = None
@@ -1394,10 +1731,13 @@ def create_employee():
     position = sanitize_input(data.get("position") or "", max_length=100)
 
     if not name or not email or not department:
-        return jsonify(error="name, email, and department are required"), 400
+        return jsonify(error="Name, email, and department are required"), 400
 
     if not validate_email(email):
-        return jsonify(error="invalid email format"), 400
+        return jsonify(error="Please enter a valid email address"), 400
+
+    if phone and not validate_phone(phone):
+        return jsonify(error="Please enter a valid phone number (10-15 digits)"), 400
 
     # Check if email already exists for this dealership
     existing = Employee.query.filter_by(
@@ -1405,7 +1745,7 @@ def create_employee():
         dealership_id=user.dealership_id
     ).first()
     if existing:
-        return jsonify(error="employee with this email already exists"), 400
+        return jsonify(error="An employee with this email already exists"), 400
 
     employee = Employee(
         name=name,
@@ -1453,6 +1793,62 @@ def list_employees():
         ok=True,
         items=[e.to_dict() for e in employees]
     )
+
+@app.get("/employees/export")
+@limiter.limit("10 per minute")
+def export_employees():
+    """Admin-only: Export employees as CSV"""
+    user, err = get_current_user()
+    if err:
+        return err
+
+    if user.role != "admin":
+        return jsonify(error="only admins can export employees"), 403
+
+    if not user.dealership_id:
+        return jsonify(error="admin has no dealership assigned"), 400
+
+    # Check subscription limits
+    dealership = Dealership.query.get(user.dealership_id)
+    if dealership and not dealership.is_subscription_active():
+        return jsonify(
+            error="subscription_expired",
+            message="Your subscription has expired. Please renew to export data."
+        ), 403
+
+    employees = Employee.query.filter_by(
+        dealership_id=user.dealership_id
+    ).order_by(Employee.created_at.desc()).all()
+
+    # Prepare data for CSV
+    csv_data = []
+    for emp in employees:
+        csv_data.append({
+            "ID": emp.id,
+            "Name": emp.name,
+            "Email": emp.email,
+            "Phone": emp.phone or "",
+            "Department": emp.department,
+            "Position": emp.position or "",
+            "Status": "Active" if emp.is_active else "Inactive",
+            "Created At": emp.created_at.isoformat(),
+            "Updated At": emp.updated_at.isoformat(),
+        })
+
+    # Generate filename with timestamp
+    timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    filename = f"employees_export_{timestamp}.csv"
+
+    # Log admin action
+    log_admin_action(
+        user.email,
+        "export_employees",
+        "employee",
+        None,
+        json.dumps({"count": len(csv_data)})
+    )
+
+    return generate_csv_response(csv_data, filename)
 
 @app.get("/employees/<int:employee_id>")
 @limiter.limit("30 per minute")
@@ -1517,7 +1913,10 @@ def update_employee(employee_id: int):
             return jsonify(error="email already in use"), 400
         employee.email = email
     if "phone" in data:
-        employee.phone = sanitize_input(data["phone"], max_length=20) or None
+        phone = sanitize_input(data["phone"], max_length=20) or None
+        if phone and not validate_phone(phone):
+            return jsonify(error="invalid phone number format"), 400
+        employee.phone = phone
     if "department" in data:
         employee.department = sanitize_input(data["department"], max_length=100)
     if "position" in data:
