@@ -157,13 +157,25 @@ Choose **ONE** of the following options:
   - Must match the endpoint URL
 
 **`STRIPE_PRICE_ID`**
-- **Description**: Stripe Price ID for subscription
+- **Description**: Stripe Price ID for monthly subscription ($199/month)
 - **Format**: `price_...`
 - **Example**: `price_1234567890abcdef`
-- **Where to Get**: Stripe Dashboard → Products → Your Product → Price ID
+- **Where to Get**: Stripe Dashboard → Products → Your Product → Monthly Price ID
 - **Required**: ✅ Yes (for subscriptions)
 - **Notes**: 
-  - Create product and price in Stripe first
+  - Create product and monthly price ($199/month) in Stripe first
+  - Use test price ID for staging
+  - Use live price ID for production
+
+**`STRIPE_PRICE_ID_ANNUAL`**
+- **Description**: Stripe Price ID for annual subscription ($166/month = $1992/year)
+- **Format**: `price_...`
+- **Example**: `price_9876543210fedcba`
+- **Where to Get**: Stripe Dashboard → Products → Your Product → Annual Price ID
+- **Required**: ❌ No (optional, for annual billing)
+- **Notes**: 
+  - Create annual price ($1992/year, billed yearly) in Stripe
+  - If not set, annual plan will fallback to monthly price
   - Use test price ID for staging
   - Use live price ID for production
 
@@ -213,8 +225,8 @@ Choose **ONE** of the following options:
 ### Local Development (.env file)
 
 ```env
-# Database
-DATABASE_URL=sqlite:///instance/star4ce.db
+# Database (PostgreSQL - REQUIRED)
+DATABASE_URL=postgresql://star4ce_user:password@localhost:5432/star4ce_db
 
 # Application
 ENVIRONMENT=development
@@ -229,6 +241,7 @@ EMAIL_FROM=noreply@yourdomain.com
 STRIPE_SECRET_KEY=sk_test_xxxxxxxxxxxxx
 STRIPE_WEBHOOK_SECRET=whsec_xxxxxxxxxxxxx
 STRIPE_PRICE_ID=price_test_xxxxxxxxxxxxx
+STRIPE_PRICE_ID_ANNUAL=price_test_yyyyyyyyyyyyy
 ```
 
 ### Production (Render)
@@ -250,6 +263,7 @@ EMAIL_FROM=noreply@star4ce.com
 STRIPE_SECRET_KEY=sk_live_xxxxxxxxxxxxx
 STRIPE_WEBHOOK_SECRET=whsec_xxxxxxxxxxxxx
 STRIPE_PRICE_ID=price_live_xxxxxxxxxxxxx
+STRIPE_PRICE_ID_ANNUAL=price_live_yyyyyyyyyyyyy
 ```
 
 ### Staging (Render)
@@ -271,6 +285,7 @@ EMAIL_FROM=staging@star4ce.com
 STRIPE_SECRET_KEY=sk_test_xxxxxxxxxxxxx
 STRIPE_WEBHOOK_SECRET=whsec_xxxxxxxxxxxxx
 STRIPE_PRICE_ID=price_test_xxxxxxxxxxxxx
+STRIPE_PRICE_ID_ANNUAL=price_test_yyyyyyyyyyyyy
 ```
 
 ---
@@ -309,7 +324,8 @@ Before going live, verify:
 - [ ] Email service is configured and tested
 - [ ] Stripe keys are for correct mode (test vs live)
 - [ ] `STRIPE_WEBHOOK_SECRET` matches your webhook endpoint
-- [ ] `STRIPE_PRICE_ID` exists in Stripe
+- [ ] `STRIPE_PRICE_ID` exists in Stripe (monthly plan)
+- [ ] `STRIPE_PRICE_ID_ANNUAL` exists in Stripe (annual plan, optional)
 - [ ] Database URL is correct and accessible
 - [ ] All secrets are kept secure (not in Git)
 

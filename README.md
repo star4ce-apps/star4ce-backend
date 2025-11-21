@@ -26,6 +26,9 @@ All guides are in the **[guides/](./guides/)** folder.
 ### 📝 Setup Files
 
 - **[ENV_SETUP.txt](./ENV_SETUP.txt)** - Environment variables template (copy to Render)
+- **[STRIPE_SETUP_GUIDE.md](./STRIPE_SETUP_GUIDE.md)** - Complete Stripe setup guide
+- **[STRIPE_CHECKLIST.md](./STRIPE_CHECKLIST.md)** - Stripe setup checklist
+- **[PROJECT_COMPLETE.md](./PROJECT_COMPLETE.md)** - Project completion checklist
 
 ---
 
@@ -33,36 +36,31 @@ All guides are in the **[guides/](./guides/)** folder.
 
 ### Local Development
 
-1. **Clone repository**:
-   ```bash
-   git clone <your-repo-url>
-   cd star4ce-backend
+1. **Set up PostgreSQL database** (see `POSTGRES_QUICK_SETUP.md`)
+
+2. **Create `.env` file**:
+   ```env
+   DATABASE_URL=postgresql://star4ce_user:password@localhost:5432/star4ce_db
+   ENVIRONMENT=development
+   JWT_SECRET=your-random-secret-32-chars-min
+   FRONTEND_URL=http://localhost:3000
    ```
 
-2. **Install dependencies**:
+3. **Install dependencies**:
    ```bash
    pip install -r requirements.txt
    ```
 
-3. **Set up environment variables**:
+4. **Start server**:
    ```bash
-   cp .env.example .env
-   # Edit .env with your values
+   python app.py
    ```
 
-4. **Run database migrations** (if needed):
-   ```bash
-   python3 app.py  # Tables auto-create on first run
-   ```
-
-5. **Start server**:
-   ```bash
-   python3 app.py
-   ```
-
-6. **Verify**:
+5. **Verify**:
    - Visit: http://localhost:5000/health
    - Should return: `{"ok": true, "service": "star4ce-backend"}`
+
+**For complete setup, see `QUICK_START.md`**
 
 ### Production Deployment
 
@@ -128,7 +126,8 @@ See **[guides/ENVIRONMENT_VARIABLES.md](./guides/ENVIRONMENT_VARIABLES.md)** for
 **Stripe** (for subscriptions):
 - `STRIPE_SECRET_KEY`
 - `STRIPE_WEBHOOK_SECRET`
-- `STRIPE_PRICE_ID`
+- `STRIPE_PRICE_ID` (Monthly: $199/month)
+- `STRIPE_PRICE_ID_ANNUAL` (Annual: $166/month = $1992/year)
 
 ---
 
