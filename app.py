@@ -25,7 +25,8 @@ CORS(app)
 # --- DATABASE SETUP ---
 
 # Get DATABASE_URL from Render (or fall back to local sqlite when running locally)
-raw_db_url = os.getenv("DATABASE_URL", "sqlite:///star4ce.db")
+# Use instance folder for local development (Flask convention)
+raw_db_url = os.getenv("DATABASE_URL", "sqlite:///instance/star4ce.db")
 
 # Render / Heroku sometimes give postgres://, SQLAlchemy needs postgresql://
 if raw_db_url.startswith("postgres://"):
@@ -601,36 +602,27 @@ def verify_email():
     code = (data.get("code") or "").strip()
 
     if not email or not code:
-        return jsonify(error="email and code are required"), 400
+        return jsonify(error="email and code required"), 400
 
     user = User.query.filter_by(email=email).first()
     if not user:
-        return jsonify(error="user not found"), 400
+        return jsonify(error="user not found"), 404
 
     if user.is_verified:
-        return jsonify(error="already verified"), 400
+        return jsonify(ok=True, message="Already verified")
 
-    # Check code
-    if not user.verification_code or user.verification_code != code:
-        return jsonify(error="invalid verification code"), 400
+    if user.verification_code != code:
+        return jsonify(error="Invalid code"), 400
 
-    # Check expiry
     if user.verification_expires_at and user.verification_expires_at < datetime.datetime.utcnow():
-        # Delete unverified account so the email can be reused cleanly
-        db.session.delete(user)
-        db.session.commit()
-        return jsonify(error="verification code expired – please register again"), 400
+        return jsonify(error="Code expired"), 400
 
-    # Mark verified
     user.is_verified = True
     user.verification_code = None
     user.verification_expires_at = None
-
     db.session.commit()
 
-    send_verified_email(user.email)
-
-    return jsonify(ok=True, email=user.email, role=user.role)
+    return jsonify(ok=True, message="Email verified successfully")
 
 @app.post("/auth/resend-verify")
 def resend_verify():
@@ -741,6 +733,7 @@ def create_access_code():
     """
     Admin-only endpoint.
     Creates a new survey access code for the admin's dealership.
+    If admin doesn't have a dealership, creates one automatically.
     """
     user, err = get_current_user()
     if err:
@@ -750,8 +743,38 @@ def create_access_code():
     if user.role != "admin":
         return jsonify(error="only admins can create survey access codes"), 403
 
+    # If admin doesn't have a dealership, create one automatically
     if not user.dealership_id:
-        return jsonify(error="admin has no dealership assigned"), 400
+        # Create a default dealership for this admin
+        dealership = Dealership(
+            name=f"Dealership for {user.email}",
+            address=None,
+            city=None,
+            state=None,
+            zip_code=None,
+        )
+        db.session.add(dealership)
+        db.session.flush()  # Get the ID without committing
+        
+        # Assign the dealership to the admin
+        user.dealership_id = dealership.id
+        db.session.commit()
+    else:
+        # Ensure the dealership still exists
+        dealership = Dealership.query.get(user.dealership_id)
+        if not dealership:
+            # Dealership was deleted, create a new one
+            dealership = Dealership(
+                name=f"Dealership for {user.email}",
+                address=None,
+                city=None,
+                state=None,
+                zip_code=None,
+            )
+            db.session.add(dealership)
+            db.session.flush()
+            user.dealership_id = dealership.id
+            db.session.commit()
 
     # Optional: read an expiry from the request body (in hours), else None
     data = request.get_json(silent=True) or {}
@@ -794,8 +817,12 @@ def list_access_codes():
     if user.role != "admin":
         return jsonify(error="only admins can list survey access codes"), 403
 
+    # If admin doesn't have a dealership, return empty list
     if not user.dealership_id:
-        return jsonify(error="admin has no dealership assigned"), 400
+        return jsonify(
+            ok=True,
+            items=[],
+        )
 
     codes = (
         SurveyAccessCode.query
@@ -841,8 +868,19 @@ def survey_invite():
     if not to_email or not code:
         return jsonify(error="email and code are required"), 400
 
+    # If admin doesn't have a dealership, create one automatically
     if not user.dealership_id:
-        return jsonify(error="admin has no dealership assigned"), 400
+        dealership = Dealership(
+            name=f"Dealership for {user.email}",
+            address=None,
+            city=None,
+            state=None,
+            zip_code=None,
+        )
+        db.session.add(dealership)
+        db.session.flush()
+        user.dealership_id = dealership.id
+        db.session.commit()
 
     # Make sure this code belongs to THIS admin's dealership,
     # is active, and not expired.
@@ -985,4 +1023,5 @@ with app.app_context():
     print("✔️ Ensured all DB tables exist in", db.engine.url)
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="127.0.0.1", port=port, debug=True)
