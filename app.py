@@ -2027,5 +2027,8 @@ with app.app_context():
     print("✔️ Ensured all DB tables exist in", db.engine.url)
 
 if __name__ == "__main__":
+    # For local development only
+    # Production uses gunicorn (see Procfile)
     port = int(os.getenv("PORT", 5000))
-    app.run(host="127.0.0.1", port=port, debug=True)
+    debug = os.getenv("ENVIRONMENT") != "production"
+    app.run(host="0.0.0.0", port=port, debug=debug)
