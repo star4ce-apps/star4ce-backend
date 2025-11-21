@@ -35,6 +35,19 @@ if raw_db_url.startswith("postgres://"):
 app.config["SQLALCHEMY_DATABASE_URI"] = raw_db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
+# PostgreSQL connection pool settings for Render (handles SSL errors and connection drops)
+if raw_db_url.startswith("postgresql://"):
+    app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+        "pool_pre_ping": True,  # Verify connections before using
+        "pool_recycle": 300,    # Recycle connections after 5 minutes
+        "pool_size": 5,         # Number of connections to maintain
+        "max_overflow": 10,     # Max connections beyond pool_size
+        "connect_args": {
+            "sslmode": "require",  # Require SSL for Render PostgreSQL
+            "connect_timeout": 10,  # Connection timeout
+        }
+    }
+
 db = SQLAlchemy(app)
 
 class Dealership(db.Model):
