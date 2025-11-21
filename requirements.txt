@@ -1,8 +1,10 @@
 flask==3.0.0
 flask-cors==4.0.0
+flask-limiter==3.5.0
 gunicorn
 PyJWT
 python-dotenv
 flask_sqlalchemy
 psycopg2-binary
 requests
+stripe==7.8.0
