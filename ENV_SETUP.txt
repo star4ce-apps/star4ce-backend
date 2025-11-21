@@ -1,0 +1,28 @@
+# Star4ce Backend Environment Variables
+# Copy these to Render Dashboard → Your Backend → Environment Variables
+
+# REQUIRED - Database
+DATABASE_URL=<your-internal-database-url-from-render>
+
+# REQUIRED - Application
+ENVIRONMENT=production
+JWT_SECRET=<generate-random-32-chars>
+FRONTEND_URL=https://your-app.vercel.app
+
+# REQUIRED - Email (Choose ONE)
+# Option 1: Resend
+RESEND_API_KEY=re_xxxxxxxxxxxxx
+EMAIL_FROM=noreply@yourdomain.com
+
+# Option 2: SMTP (uncomment if using)
+# SMTP_HOST=smtp.gmail.com
+# SMTP_PORT=587
+# SMTP_USER=your-email@gmail.com
+# SMTP_PASSWORD=your-app-password
+# SMTP_FROM=your-email@gmail.com
+
+# REQUIRED - Stripe
+STRIPE_SECRET_KEY=sk_live_xxxxxxxxxxxxx
+STRIPE_WEBHOOK_SECRET=whsec_xxxxxxxxxxxxx
+STRIPE_PRICE_ID=price_xxxxxxxxxxxxx
+
