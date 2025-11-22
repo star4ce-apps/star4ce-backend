@@ -1,174 +1,104 @@
 # Star4ce Backend
 
-HR platform backend for car dealerships - built with Flask, PostgreSQL, and Stripe.
+HR platform backend for car dealerships - built with Flask, SQLite (local) / PostgreSQL (production), and Stripe.
 
 ---
 
-## 📚 Documentation
+## 🚀 Quick Start (Local Development)
 
-All guides are in the **[guides/](./guides/)** folder.
-
-### 🚀 Quick Start Guides
-
-- **[guides/QUICK_SETUP.md](./guides/QUICK_SETUP.md)** - ⭐ Quick checklist if Vercel/Render already connected
-- **[guides/SIMPLE_DEPLOYMENT.md](./guides/SIMPLE_DEPLOYMENT.md)** - Simple step-by-step deployment guide
-- **[guides/SIMPLE_OWNER_GUIDE.md](./guides/SIMPLE_OWNER_GUIDE.md)** - Simple guide for non-technical owners
-
-### 📖 Complete Guides
-
-- **[guides/DEPLOYMENT_GUIDE.md](./guides/DEPLOYMENT_GUIDE.md)** - Complete deployment instructions
-- **[guides/OWNER_GUIDE.md](./guides/OWNER_GUIDE.md)** - Comprehensive owner guide
-- **[guides/QUICK_START_CHECKLIST.md](./guides/QUICK_START_CHECKLIST.md)** - Pre-deployment checklist
-- **[guides/ENVIRONMENT_VARIABLES.md](./guides/ENVIRONMENT_VARIABLES.md)** - Environment variables reference
-- **[guides/DATABASE_MAINTENANCE.md](./guides/DATABASE_MAINTENANCE.md)** - Database backup and maintenance
-- **[guides/TROUBLESHOOTING.md](./guides/TROUBLESHOOTING.md)** - Common issues and solutions
-
-### 📝 Setup Files
-
-- **[ENV_SETUP.txt](./ENV_SETUP.txt)** - Environment variables template (copy to Render)
-- **[STRIPE_SETUP_GUIDE.md](./STRIPE_SETUP_GUIDE.md)** - Complete Stripe setup guide
-- **[STRIPE_CHECKLIST.md](./STRIPE_CHECKLIST.md)** - Stripe setup checklist
-- **[PROJECT_COMPLETE.md](./PROJECT_COMPLETE.md)** - Project completion checklist
-
----
-
-## 🚀 Quick Start
-
-### Local Development
-
-1. **Set up PostgreSQL database** (see `POSTGRES_QUICK_SETUP.md`)
-
-2. **Create `.env` file**:
-   ```env
-   DATABASE_URL=postgresql://star4ce_user:password@localhost:5432/star4ce_db
-   ENVIRONMENT=development
-   JWT_SECRET=your-random-secret-32-chars-min
-   FRONTEND_URL=http://localhost:3000
-   ```
-
-3. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. **Start server**:
-   ```bash
-   python app.py
-   ```
-
-5. **Verify**:
-   - Visit: http://localhost:5000/health
-   - Should return: `{"ok": true, "service": "star4ce-backend"}`
-
-**For complete setup, see `QUICK_START.md`**
-
-### Production Deployment
-
-See **[guides/DEPLOYMENT_GUIDE.md](./guides/DEPLOYMENT_GUIDE.md)** for complete instructions.
-
-**Quick Steps**:
-1. Create PostgreSQL database on Render
-2. Deploy backend to Render
-3. Set all environment variables
-4. Deploy frontend to Vercel
-5. Configure Stripe webhooks
-6. Test everything
-
----
-
-## 📋 Features
-
-- ✅ User authentication (JWT)
-- ✅ Email verification
-- ✅ Password reset
-- ✅ Employee management
-- ✅ Survey access codes
-- ✅ Survey responses
-- ✅ Analytics dashboard
-- ✅ Stripe subscription management
-- ✅ Admin audit logging
-- ✅ Rate limiting
-- ✅ CORS protection
-
----
-
-## 🗄️ Database
-
-**Production**: PostgreSQL on Render  
-**Development**: SQLite (local) or PostgreSQL
-
-**Tables**:
-- `users` - User accounts
-- `dealerships` - Dealership information and subscriptions
-- `employees` - Employee records
-- `survey_access_codes` - Survey access codes
-- `survey_responses` - Survey submissions
-- `admin_audit_logs` - Admin action audit trail
-
-**Auto-creation**: Tables are created automatically on first startup.
-
----
-
-## 🔐 Environment Variables
-
-See **[guides/ENVIRONMENT_VARIABLES.md](./guides/ENVIRONMENT_VARIABLES.md)** for complete list.
-
-**Required**:
-- `DATABASE_URL` - PostgreSQL connection string
-- `JWT_SECRET` - Secret for JWT tokens
-- `FRONTEND_URL` - Frontend application URL
-- `ENVIRONMENT` - `production` | `staging` | `development`
-
-**Email** (choose one):
-- Resend: `RESEND_API_KEY`, `EMAIL_FROM`
-- SMTP: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`
-
-**Stripe** (for subscriptions):
-- `STRIPE_SECRET_KEY`
-- `STRIPE_WEBHOOK_SECRET`
-- `STRIPE_PRICE_ID` (Monthly: $199/month)
-- `STRIPE_PRICE_ID_ANNUAL` (Annual: $166/month = $1992/year)
-
----
-
-## 💾 Database Backups
-
-**Automatic**: Render provides automatic backups (daily on free tier)
-
-**Manual**: Use `backup_database.py`:
+### 1. Install Dependencies
 ```bash
-python3 backup_database.py
+pip install -r requirements.txt
 ```
 
-**Restore**: Use `restore_database.py`:
-```bash
-python3 restore_database.py /path/to/backup.sql
+### 2. Create `.env` File (Optional - SQLite works without it)
+```env
+# For local development, SQLite is used by default
+# Only add these if you want to customize:
+
+JWT_SECRET=your-random-secret-32-chars-minimum
+FRONTEND_URL=http://localhost:3000
+ENVIRONMENT=development
+
+# Email (Optional - for testing email features)
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your-email@gmail.com
+SMTP_PASSWORD=your-app-password
+SMTP_FROM=your-email@gmail.com
+
+# Stripe (Required for subscription testing)
+STRIPE_SECRET_KEY=sk_test_xxxxxxxxxxxxx
+STRIPE_PRICE_ID=price_xxxxxxxxxxxxx
+STRIPE_PRICE_ID_ANNUAL=price_yyyyyyyyyyyyy
 ```
 
-See **[guides/DATABASE_MAINTENANCE.md](./guides/DATABASE_MAINTENANCE.md)** for details.
+### 3. Start Server
+```bash
+python app.py
+```
+
+### 4. Verify It's Running
+- Visit: http://localhost:5000/health
+- Should return: `{"ok": true, "service": "star4ce-backend"}`
+
+**That's it!** The database (SQLite) will be created automatically in `instance/star4ce.db`
 
 ---
 
 ## 🧪 Testing
 
-### Health Check
+**See [LOCAL_TESTING_CHECKLIST.md](./LOCAL_TESTING_CHECKLIST.md) for complete testing guide.**
+
+### Quick Test
+1. Start backend: `python app.py`
+2. Start frontend: `cd ../star4ce-frontend && npm run dev`
+3. Go to http://localhost:3000
+4. Test admin registration and subscription flow
+
+---
+
+## 🗄️ Database
+
+**Local Development**: SQLite (automatic, no setup needed)  
+**Production**: PostgreSQL (on Render)
+
+### Manage Users (Local)
 ```bash
-curl https://your-backend.onrender.com/health
+# List all users
+python delete_user.py list
+
+# Delete a user
+python delete_user.py user@email.com --yes
 ```
 
-### Test User Registration
-```bash
-curl -X POST https://your-backend.onrender.com/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{"email": "test@example.com", "password": "password123"}'
-```
+---
 
-### Test Login
-```bash
-curl -X POST https://your-backend.onrender.com/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"email": "test@example.com", "password": "password123"}'
-```
+## 📋 Key Features
+
+- ✅ User authentication (JWT)
+- ✅ Email verification
+- ✅ Password reset
+- ✅ Employee management
+- ✅ Survey system
+- ✅ Analytics dashboard
+- ✅ Stripe subscriptions (Monthly $199, Annual $166/month)
+- ✅ Role-based access (Admin, Manager, Corporate)
+
+---
+
+## 🔐 Environment Variables
+
+**Required for Production** (see `ENV_SETUP.txt`):
+- `DATABASE_URL` - PostgreSQL connection string
+- `JWT_SECRET` - Secret for JWT tokens
+- `FRONTEND_URL` - Frontend URL
+- `STRIPE_SECRET_KEY` - Stripe secret key
+- `STRIPE_PRICE_ID` - Monthly subscription price ID
+- `STRIPE_PRICE_ID_ANNUAL` - Annual subscription price ID
+
+**Optional** (for email features):
+- SMTP settings or Resend API key
 
 ---
 
@@ -182,10 +112,15 @@ curl -X POST https://your-backend.onrender.com/auth/login \
 - `POST /auth/reset` - Reset password
 - `GET /auth/me` - Get current user
 
+### Subscriptions
+- `POST /subscription/create-checkout` - Create Stripe checkout
+- `GET /subscription/status` - Get subscription status
+- `POST /subscription/cancel` - Cancel subscription
+- `POST /subscription/webhook` - Stripe webhook handler
+
 ### Employees
 - `GET /employees` - List employees
 - `POST /employees` - Create employee
-- `GET /employees/<id>` - Get employee
 - `PUT /employees/<id>` - Update employee
 - `DELETE /employees/<id>` - Delete employee
 
@@ -197,144 +132,56 @@ curl -X POST https://your-backend.onrender.com/auth/login \
 ### Analytics
 - `GET /analytics/summary` - Summary statistics
 - `GET /analytics/time-series` - Time series data
-- `GET /analytics/role-breakdown` - Breakdown by role
-
-### Subscriptions
-- `GET /subscription/status` - Get subscription status
-- `POST /subscription/create-checkout` - Create Stripe checkout
-- `POST /subscription/webhook` - Stripe webhook handler
-- `POST /subscription/cancel` - Cancel subscription
-
-### Audit Logs
-- `GET /audit-logs` - Get admin audit logs
 
 ---
 
 ## 🛠️ Development
 
 ### Project Structure
-
 ```
 star4ce-backend/
 ├── app.py                 # Main application
-├── backup_database.py     # Backup script
-├── restore_database.py    # Restore script
+├── delete_user.py         # User management script
 ├── requirements.txt       # Python dependencies
-├── Procfile              # Render deployment config
-├── runtime.txt           # Python version
-└── docs/                 # Documentation
+└── instance/              # SQLite database (auto-created)
+    └── star4ce.db
 ```
 
-### Adding New Features
-
-1. **Create feature branch**:
-   ```bash
-   git checkout -b feature/new-feature
-   ```
-
-2. **Make changes**
-
-3. **Test locally**:
-   ```bash
-   python3 app.py
-   ```
-
-4. **Test in staging** (if available)
-
-5. **Deploy to production**
+### Adding Features
+1. Make changes to `app.py`
+2. Test locally
+3. Restart server: `python app.py`
 
 ---
 
 ## 🐛 Troubleshooting
 
-See **[guides/TROUBLESHOOTING.md](./guides/TROUBLESHOOTING.md)** for common issues.
+**Backend won't start?**
+- Check if port 5000 is available
+- Check for errors in terminal
+- Make sure dependencies are installed: `pip install -r requirements.txt`
 
-**Quick fixes**:
-- Backend won't start → Check environment variables
-- Database errors → Check `DATABASE_URL`
-- Email not sending → Check email service credentials
-- Stripe not working → Check Stripe keys and webhook
+**Database errors?**
+- SQLite database is auto-created in `instance/star4ce.db`
+- If issues, delete `instance/star4ce.db` and restart (will recreate)
 
----
+**Email not working?**
+- Email is optional for local testing
+- Check SMTP settings in `.env` if configured
 
-## 📞 Support
-
-**For Technical Issues**:
-- Check documentation first
-- Review logs (Render Dashboard)
-- Check troubleshooting guide
-- Contact developer
-
-**For Business/Owner Questions**:
-- See **[guides/OWNER_GUIDE.md](./guides/OWNER_GUIDE.md)**
-- Contact developer
+**Stripe not working?**
+- Make sure `STRIPE_SECRET_KEY` is set in `.env`
+- Use test mode keys (start with `sk_test_`)
+- Use test card: `4242 4242 4242 4242`
 
 ---
 
-## 🔒 Security
+## 📝 Files
 
-- ✅ JWT authentication
-- ✅ Password hashing (bcrypt)
-- ✅ Rate limiting
-- ✅ CORS protection
-- ✅ Input sanitization
-- ✅ SQL injection protection (SQLAlchemy)
-- ✅ Environment variable secrets
-- ✅ Audit logging
-
-**Best Practices**:
-- Never commit secrets to Git
-- Use strong `JWT_SECRET`
-- Keep dependencies updated
-- Monitor logs for suspicious activity
-- Regular security audits
+- **[LOCAL_TESTING_CHECKLIST.md](./LOCAL_TESTING_CHECKLIST.md)** - Complete testing guide
+- **[ENV_SETUP.txt](./ENV_SETUP.txt)** - Environment variables template
+- **[delete_user.py](./delete_user.py)** - User management script
 
 ---
 
-## 📝 License
-
-See [LICENSE](./LICENSE) file.
-
----
-
-## 🗺️ Roadmap
-
-- [x] Export functionality (CSV)
-- [ ] Email templates customization
-- [ ] Advanced analytics
-- [ ] Multi-language support
-- [ ] Mobile app API
-- [ ] Webhook notifications
-- [ ] Advanced reporting
-
----
-
-## 📚 Additional Resources
-
-- [Flask Documentation](https://flask.palletsprojects.com/)
-- [SQLAlchemy Documentation](https://docs.sqlalchemy.org/)
-- [Stripe API Documentation](https://stripe.com/docs/api)
-- [Render Documentation](https://render.com/docs)
-- [PostgreSQL Documentation](https://www.postgresql.org/docs/)
-
----
-
-**Last Updated**: 2025-01-20  
-**Version**: 1.0
-
----
-
-## 🎯 For Contract Developers
-
-When handing off to the owner:
-
-1. ✅ Complete **[guides/QUICK_START_CHECKLIST.md](./guides/QUICK_START_CHECKLIST.md)**
-2. ✅ Share **[guides/OWNER_GUIDE.md](./guides/OWNER_GUIDE.md)** with owner
-3. ✅ Document all credentials securely
-4. ✅ Set up automated backups
-5. ✅ Test restore process
-6. ✅ Provide emergency contact information
-7. ✅ Walk owner through basic operations
-8. ✅ Document any custom configurations
-
-**Remember**: The owner is not technical. Keep instructions simple and provide ongoing support as needed.
+**Ready to test?** See [LOCAL_TESTING_CHECKLIST.md](./LOCAL_TESTING_CHECKLIST.md) 🚀

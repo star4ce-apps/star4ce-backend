@@ -92,17 +92,22 @@ limiter = Limiter(
 
 # --- DATABASE SETUP ---
 
-# Get DATABASE_URL from environment (PostgreSQL required)
-# For local development, set DATABASE_URL in .env file
+# Get DATABASE_URL from environment (PostgreSQL for production, SQLite for local dev)
+# For local development, defaults to SQLite if DATABASE_URL is not set
+# For production, set DATABASE_URL in .env file
 # Example: DATABASE_URL=postgresql://user:password@localhost:5432/star4ce_db
-raw_db_url = os.getenv("DATABASE_URL")
+raw_db_url = os.getenv("DATABASE_URL", "sqlite:///instance/star4ce.db")
 
-if not raw_db_url:
-    raise ValueError(
-        "DATABASE_URL environment variable is required. "
-        "For local development, create a .env file with: "
-        "DATABASE_URL=postgresql://user:password@localhost:5432/star4ce_db"
-    )
+# Fix SQLite path for Windows - convert to absolute path if relative
+if raw_db_url.startswith("sqlite:///"):
+    db_path = raw_db_url.replace("sqlite:///", "")
+    if not os.path.isabs(db_path):
+        # Make it relative to the app directory
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+        db_path = os.path.join(app_dir, db_path)
+        # Normalize path separators for SQLite
+        db_path = db_path.replace("\\", "/")
+        raw_db_url = f"sqlite:///{db_path}"
 
 # Render / Heroku sometimes give postgres://, SQLAlchemy needs postgresql://
 if raw_db_url.startswith("postgres://"):
