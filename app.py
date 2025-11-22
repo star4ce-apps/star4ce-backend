@@ -1239,7 +1239,7 @@ def me():
                                         # Create new dealership for this subscription
                                         subscription = subscriptions.data[0]
                                         dealership = Dealership(
-                                            name=f"Dealership for {user.email}",
+                                            name=f"{user.full_name or user.email}'s Dealership",
                                             subscription_status="active",
                                             subscription_plan="pro",
                                             stripe_customer_id=customer.id,
@@ -1899,10 +1899,17 @@ def verify_email():
     user.verification_expires_at = None
     db.session.commit()
 
-    # Check if this is an admin registration (manager role, no dealership, not approved yet)
+    # Check if this is an admin registration (manager role, no dealership, not approved yet, no pending request)
+    # Admin registration = manager with no dealership and no pending manager request
+    has_pending_request = ManagerDealershipRequest.query.filter_by(
+        manager_id=user.id,
+        status="pending"
+    ).first() is not None
+    
     is_admin_registration = (user.role == "manager" and 
                              not user.dealership_id and 
-                             not user.is_approved)
+                             not user.is_approved and
+                             not has_pending_request)
     
     if is_admin_registration:
         # Admin registration - they need to subscribe
@@ -1911,6 +1918,14 @@ def verify_email():
             ok=True, 
             message="Email verified successfully. Please subscribe to become an admin.",
             redirect_to_subscription=True
+        )
+    elif user.role == "manager" and has_pending_request:
+        # Manager with pending request - they need to wait for admin approval
+        send_verified_email(user.email)
+        return jsonify(
+            ok=True, 
+            message="Email verified successfully. Your request to join the dealership is pending admin approval. Please wait for an admin to approve your request.",
+            is_manager_pending=True
         )
     else:
         # Regular verification - send confirmation email
@@ -3172,7 +3187,7 @@ def handle_checkout_completed(session):
         if not dealership:
             # Create new dealership for this user
             # Get dealership info from metadata if provided
-            dealership_name = metadata.get("dealership_name", "").strip() or f"Dealership for {user.email}"
+            dealership_name = metadata.get("dealership_name", "").strip() or f"{user.full_name or user.email}'s Dealership"
             dealership_address = metadata.get("dealership_address", "").strip() or None
             dealership_city = metadata.get("dealership_city", "").strip() or None
             dealership_state = metadata.get("dealership_state", "").strip() or None
