@@ -1,4 +1,5 @@
 ﻿import os, datetime, jwt, smtplib, secrets, json, random, requests
+from urllib.parse import quote
 import csv
 import io
 try:
@@ -223,6 +224,9 @@ class User(db.Model):
     is_approved = db.Column(db.Boolean, nullable=False, default=False)
     approved_at = db.Column(db.DateTime, nullable=True)
     approved_by = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)  # Admin who approved
+    
+    # Timestamp for account creation (for cleanup of unsubscribed accounts)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.datetime.utcnow)
 
     def to_dict(self):
         return {
@@ -1134,16 +1138,15 @@ def register():
 
         db.session.commit()
 
-        # For admin registration, don't send verification email (will be auto-verified after payment)
-        # For manager registration, send verification email
-        if not is_admin_registration:
-            send_verification_email(user.email, verification_code)
-            if manager_request_id:
-                message = "Verification code sent to your email. Please verify before logging in. Your request to join the dealership is pending admin approval."
-            else:
-                message = "Verification code sent to your email. Please verify before logging in."
+        # Send verification email for both admin and manager registration
+        # Admin must verify email first, then subscribe
+        send_verification_email(user.email, verification_code)
+        if is_admin_registration:
+            message = "Verification code sent to your email. Please verify your email, then you'll be redirected to subscribe and become an admin."
+        elif manager_request_id:
+            message = "Verification code sent to your email. Please verify before logging in. Your request to join the dealership is pending admin approval."
         else:
-            message = "Account created. Complete your subscription payment to become an admin."
+            message = "Verification code sent to your email. Please verify before logging in."
 
         # Do NOT log them in yet; they must verify first (or complete payment for admin registration).
         return jsonify(
@@ -1896,10 +1899,23 @@ def verify_email():
     user.verification_expires_at = None
     db.session.commit()
 
-    # Send confirmation email
-    send_verified_email(user.email)
-
-    return jsonify(ok=True, message="Email verified successfully")
+    # Check if this is an admin registration (manager role, no dealership, not approved yet)
+    is_admin_registration = (user.role == "manager" and 
+                             not user.dealership_id and 
+                             not user.is_approved)
+    
+    if is_admin_registration:
+        # Admin registration - they need to subscribe
+        # Don't send verified email yet, they need to subscribe first
+        return jsonify(
+            ok=True, 
+            message="Email verified successfully. Please subscribe to become an admin.",
+            redirect_to_subscription=True
+        )
+    else:
+        # Regular verification - send confirmation email
+        send_verified_email(user.email)
+        return jsonify(ok=True, message="Email verified successfully")
 
 @app.post("/auth/resend-verify")
 @limiter.limit("3 per hour")
@@ -2806,6 +2822,7 @@ def create_checkout_session():
     """
     # Try to get current user, but don't require authentication
     user = None
+    email = None  # Initialize email variable
     auth = request.headers.get("Authorization", "") or request.headers.get("authorization", "")
     if auth.startswith("Bearer "):
         token = auth.split(" ", 1)[1].strip()
@@ -2836,6 +2853,10 @@ def create_checkout_session():
     # Get email from request or user
     if not email:
         email = data.get("email", "").strip().lower() if not user else user.email
+    
+    # If no user found but email provided, try to find user by email
+    if not user and email:
+        user = User.query.filter_by(email=email).first()
     
     # If no user and no email provided, return error
     if not user and not email:
@@ -2902,12 +2923,12 @@ def create_checkout_session():
                 # Check if user already exists by email
                 existing = User.query.filter_by(email=email).first()
                 if existing:
-                    # Check if this is a pending admin registration
+                    # Check if this is a pending admin registration (verified or not, but not subscribed)
                     if (existing.role == "manager" and 
-                        not existing.is_verified and 
                         not existing.is_approved and 
                         not existing.dealership_id):
                         # This is a pending admin registration - allow checkout
+                        # They may be verified but not subscribed yet
                         user = existing
                     else:
                         # User exists but not a pending admin registration - they should log in first
@@ -2942,7 +2963,8 @@ def create_checkout_session():
             user_id_for_checkout = temp_user.id
             user = temp_user
         
-        # Create or get Stripe customer
+        # Don't create Stripe customer yet - wait until payment is confirmed in webhook
+        # Check if existing dealership has a customer_id (for resubscriptions)
         customer_id = None
         if dealership_id:
             dealership = Dealership.query.get(dealership_id)
@@ -2954,7 +2976,7 @@ def create_checkout_session():
                 except stripe._error.InvalidRequestError as e:
                     # Customer doesn't exist in Stripe, clear it from database
                     if "No such customer" in str(e):
-                        print(f"[STRIPE] Customer {customer_id} not found in Stripe, creating new customer", flush=True)
+                        print(f"[STRIPE] Customer {customer_id} not found in Stripe, will create after payment", flush=True)
                         customer_id = None
                         if dealership:
                             dealership.stripe_customer_id = None
@@ -2962,53 +2984,33 @@ def create_checkout_session():
                     else:
                         raise
                 except Exception as e:
-                    # Other Stripe errors - log and try to create new customer
-                    print(f"[STRIPE] Error retrieving customer {customer_id}: {e}, creating new customer", flush=True)
+                    # Other Stripe errors - log and will create after payment
+                    print(f"[STRIPE] Error retrieving customer {customer_id}: {e}, will create after payment", flush=True)
                     customer_id = None
                     if dealership:
                         dealership.stripe_customer_id = None
                         db.session.commit()
-        
-        if not customer_id:
-            # Create new Stripe customer
-            try:
-                customer = stripe.Customer.create(
-                    email=user.email,
-                    metadata={"user_id": user.id, "dealership_id": str(dealership_id) if dealership_id else "new"}
-                )
-                customer_id = customer.id
-            except AttributeError as ae:
-                # Handle Python 3.14 compatibility issue with Stripe
-                if "'NoneType' object has no attribute 'Secret'" in str(ae):
-                    raise Exception("Stripe library compatibility issue. Please use Python 3.11 or 3.12, or update Stripe library.")
-                raise
-            
-            # Save customer ID if dealership exists
-            if dealership_id:
-                dealership = Dealership.query.get(dealership_id)
-                if dealership:
-                    dealership.stripe_customer_id = customer_id
-                    db.session.commit()
 
-        # Create checkout session
-        # Ensure we have a valid customer_id
-        if not customer_id:
-            # This should not happen, but safety check
-            print(f"[STRIPE ERROR] No customer_id available for checkout", flush=True)
-            return jsonify(error="Failed to create customer for checkout"), 500
+        # Ensure email is set (should be set by now, but safety check)
+        if not email and user:
+            email = user.email
+        if not email:
+            return jsonify(error="Email is required for checkout"), 400
         
+        # Create checkout session - don't require customer_id, use customer_email instead
+        # Stripe will create the customer automatically when payment succeeds
         try:
-            checkout_session = stripe.checkout.Session.create(
-                customer=customer_id,
-                payment_method_types=["card"],
-                line_items=[{
+            checkout_params = {
+                "customer_email": email,  # Use email instead of customer_id - Stripe will create customer on payment
+                "payment_method_types": ["card"],
+                "line_items": [{
                     "price": price_id,
                     "quantity": 1,
                 }],
-                mode="subscription",
-                success_url=f"{FRONTEND_URL}/dashboard?subscription=success",
-                cancel_url=f"{FRONTEND_URL}/admin-register?subscription=canceled&user_id={user_id_for_checkout}",
-                metadata={
+                "mode": "subscription",
+                "success_url": f"{FRONTEND_URL}/dashboard?subscription=success",
+                "cancel_url": f"{FRONTEND_URL}/admin-subscribe?subscription=canceled&email={quote(email)}&user_id={user_id_for_checkout}",
+                "metadata": {
                     "user_id": str(user_id_for_checkout),
                     "dealership_id": str(dealership_id) if dealership_id else "new",
                     "user_email": email,
@@ -3021,67 +3023,22 @@ def create_checkout_session():
                     "dealership_state": (data.get("dealership_state") or "").strip() or "",
                     "dealership_zip_code": (data.get("dealership_zip_code") or "").strip() or "",
                 },
-            )
-        except stripe._error.InvalidRequestError as e:
-            # If customer doesn't exist, create a new one and retry
-            if "No such customer" in str(e) and customer_id:
-                print(f"[STRIPE] Customer {customer_id} invalid in checkout, creating new customer", flush=True)
-                # Clear invalid customer ID
-                if dealership_id:
-                    dealership = Dealership.query.get(dealership_id)
-                    if dealership:
-                        dealership.stripe_customer_id = None
-                        db.session.commit()
-                
-                # Create new customer
-                try:
-                    customer = stripe.Customer.create(
-                        email=user.email,
-                        metadata={"user_id": user.id, "dealership_id": str(dealership_id) if dealership_id else "new"}
-                    )
-                    customer_id = customer.id
-                    
-                    # Save new customer ID
-                    if dealership_id:
-                        dealership = Dealership.query.get(dealership_id)
-                        if dealership:
-                            dealership.stripe_customer_id = customer_id
-                            db.session.commit()
-                    
-                    # Retry checkout session creation
-                    checkout_session = stripe.checkout.Session.create(
-                        customer=customer_id,
-                        payment_method_types=["card"],
-                        line_items=[{
-                            "price": price_id,
-                            "quantity": 1,
-                        }],
-                        mode="subscription",
-                        success_url=f"{FRONTEND_URL}/dashboard?subscription=success",
-                        cancel_url=f"{FRONTEND_URL}/dashboard?subscription=canceled",
-                        metadata={
-                            "user_id": user.id,
-                            "dealership_id": str(dealership_id) if dealership_id else "new",
-                            "user_email": user.email
-                        },
-                    )
-                except Exception as retry_err:
-                    error_msg = str(retry_err)
-                    print(f"[STRIPE ERROR] Failed to create customer/checkout on retry: {error_msg}", flush=True)
-                    import traceback
-                    traceback.print_exc()
-                    if os.getenv("ENVIRONMENT") != "production":
-                        return jsonify(error=f"Failed to create checkout session: {error_msg}"), 500
-                    return jsonify(error="Failed to create checkout session"), 500
-            else:
-                # Other InvalidRequestError - re-raise
-                error_msg = str(e)
-                print(f"[STRIPE ERROR] Checkout creation failed: {error_msg}", flush=True)
-                import traceback
-                traceback.print_exc()
-                if os.getenv("ENVIRONMENT") != "production":
-                    return jsonify(error=f"Failed to create checkout session: {error_msg}"), 500
-                return jsonify(error="Failed to create checkout session"), 500
+            }
+            
+            # Only add customer if we have an existing one (for resubscriptions)
+            if customer_id:
+                checkout_params["customer"] = customer_id
+            
+            checkout_session = stripe.checkout.Session.create(**checkout_params)
+        except Exception as e:
+            # Log error and return
+            error_msg = str(e)
+            print(f"[STRIPE ERROR] Checkout creation failed: {error_msg}", flush=True)
+            import traceback
+            traceback.print_exc()
+            if os.getenv("ENVIRONMENT") != "production":
+                return jsonify(error=f"Failed to create checkout session: {error_msg}"), 500
+            return jsonify(error="Failed to create checkout session"), 500
         except AttributeError as ae:
             # Handle Python 3.14 compatibility issue with Stripe
             if "'NoneType' object has no attribute 'Secret'" in str(ae):
@@ -3163,15 +3120,21 @@ def handle_checkout_completed(session):
             print(f"[WEBHOOK ERROR] User {user_id} not found", flush=True)
             return
         
-        # If this is a new admin registration, ensure user is verified and approved
-        # Always verify and approve users who complete checkout (they paid)
-        if is_new_admin or user.role == "manager":
-            user.is_verified = True  # Auto-verify on payment
-            user.is_approved = True  # Auto-approve on payment
+        # If this is a new admin registration, user should already be verified
+        # (they verified email before subscribing)
+        if is_new_admin or (user.role == "manager" and not user.dealership_id):
+            # User already verified email before subscribing, so just approve them
+            user.is_approved = True  # Auto-approve on payment (they paid)
             if not user.approved_at:
                 user.approved_at = datetime.datetime.utcnow()
-            # Also check if user has no password (created during checkout) and needs one set
-            # This shouldn't happen if we create user before checkout, but safety check
+            
+            # Ensure they're verified (should already be true, but safety check)
+            if not user.is_verified:
+                user.is_verified = True
+                print(f"[WEBHOOK] Auto-verified user {user.email} after payment (should have been verified already)", flush=True)
+            
+            db.session.commit()
+            print(f"[WEBHOOK] User {user.email} approved after payment (already verified)", flush=True)
 
         # Create or get dealership
         dealership = None
@@ -3223,8 +3186,25 @@ def handle_checkout_completed(session):
                 # Fallback: 1 month from now if we can't retrieve from Stripe
                 dealership.subscription_ends_at = datetime.datetime.utcnow() + datetime.timedelta(days=30)
         
-        # Update Stripe customer ID if not set
+        # Get or create Stripe customer - create it now that payment is confirmed
         customer_id = session.get("customer")
+        if not customer_id:
+            # Customer wasn't created yet - create it now after payment
+            try:
+                customer = stripe.Customer.create(
+                    email=user.email,
+                    metadata={
+                        "user_id": str(user.id),
+                        "dealership_id": str(dealership.id)
+                    }
+                )
+                customer_id = customer.id
+                print(f"[WEBHOOK] Created Stripe customer {customer_id} for user {user.email} after payment", flush=True)
+            except Exception as e:
+                print(f"[WEBHOOK ERROR] Failed to create Stripe customer: {e}", flush=True)
+                # Continue without customer_id - subscription will still work
+        
+        # Save customer ID to dealership
         if customer_id:
             dealership.stripe_customer_id = customer_id
 
@@ -4934,9 +4914,171 @@ with app.app_context():
     
     print("[OK] Ensured all DB tables exist in", db.engine.url)
 
+@app.post("/admin/cleanup-unsubscribed")
+@limiter.limit("10 per hour")
+def cleanup_unsubscribed_admins():
+    """
+    Cleanup endpoint to delete admin accounts that haven't subscribed.
+    - Unverified users: Delete immediately (no time threshold)
+    - Verified but unsubscribed users: Delete after 24 hours (or configurable time)
+    """
+    try:
+        # Get time threshold for verified users (default 24 hours)
+        hours_threshold = int(request.args.get("hours", 24))
+        threshold_time = datetime.datetime.utcnow() - datetime.timedelta(hours=hours_threshold)
+        
+        deleted_count = 0
+        
+        # 1. Delete unverified admin registrations immediately (no time threshold)
+        unverified = User.query.filter(
+            User.role == "manager",
+            User.is_verified == False,
+            User.is_approved == False,
+            User.dealership_id == None
+        ).all()
+        
+        for user in unverified:
+            print(f"[CLEANUP] Deleting unverified admin account: {user.email} (created {user.created_at})", flush=True)
+            db.session.delete(user)
+            deleted_count += 1
+        
+        # 2. Delete verified but unsubscribed admin accounts after time threshold
+        verified_unsubscribed = User.query.filter(
+            User.role == "manager",
+            User.is_verified == True,
+            User.is_approved == False,
+            User.dealership_id == None,
+            User.created_at < threshold_time
+        ).all()
+        
+        for user in verified_unsubscribed:
+            print(f"[CLEANUP] Deleting verified but unsubscribed admin account: {user.email} (created {user.created_at}, verified but not subscribed after {hours_threshold}h)", flush=True)
+            # Send deletion email for verified users
+            try:
+                user_email = user.email
+                user_full_name = user.full_name or "User"
+                subject = "Star4ce – Account Cancellation"
+                body = f"""Hello {user_full_name},
+
+Your Star4ce account ({user_email}) has been automatically deleted because you did not complete your subscription within the required time.
+
+If you change your mind, you can register again at any time.
+
+Thank you for your interest in Star4ce.
+
+– Star4ce Team
+"""
+                send_email_via_resend_or_smtp(user_email, subject, body)
+            except Exception as e:
+                print(f"[CLEANUP WARNING] Failed to send deletion email to {user.email}: {e}", flush=True)
+            
+            db.session.delete(user)
+            deleted_count += 1
+        
+        db.session.commit()
+        
+        return jsonify(
+            ok=True,
+            message=f"Cleaned up {deleted_count} unsubscribed admin account(s)",
+            deleted_count=deleted_count
+        )
+    except Exception as e:
+        db.session.rollback()
+        print(f"[CLEANUP ERROR] {str(e)}", flush=True)
+        return jsonify(error=f"Cleanup failed: {str(e)}"), 500
+
+@app.get("/auth/check-unsubscribed")
+@limiter.limit("20 per minute")
+def check_unsubscribed():
+    """Check if a user is verified but not subscribed (should be deleted)"""
+    try:
+        email = request.args.get("email", "").strip().lower()
+        if not email:
+            return jsonify(error="email is required"), 400
+        
+        user = User.query.filter_by(email=email).first()
+        if not user:
+            return jsonify(should_delete=False, message="User not found")
+        
+        # Check if user is verified but not subscribed (not approved, no dealership)
+        should_delete = (
+            user.role == "manager" and
+            user.is_verified == True and
+            user.is_approved == False and
+            user.dealership_id == None
+        )
+        
+        return jsonify(
+            should_delete=should_delete,
+            is_verified=user.is_verified,
+            is_approved=user.is_approved,
+            has_dealership=user.dealership_id is not None
+        )
+    except Exception as e:
+        print(f"[CHECK ERROR] {str(e)}", flush=True)
+        return jsonify(error=f"Check failed: {str(e)}"), 500
+
+@app.post("/admin/delete-unsubscribed")
+@limiter.limit("10 per hour")
+def delete_unsubscribed():
+    """Delete an unsubscribed admin account and send notification email"""
+    try:
+        data = request.get_json(force=True) or {}
+        email = sanitize_input(data.get("email") or "").strip().lower()
+        user_id = data.get("user_id")
+        
+        if not email and not user_id:
+            return jsonify(error="email or user_id is required"), 400
+        
+        # Find user by email or user_id
+        if user_id:
+            user = User.query.get(int(user_id))
+        else:
+            user = User.query.filter_by(email=email).first()
+        
+        if not user:
+            return jsonify(error="user not found"), 404
+        
+        # Only delete if they're verified but not subscribed
+        if not (user.role == "manager" and user.is_verified and not user.is_approved and not user.dealership_id):
+            return jsonify(error="User does not match criteria for deletion"), 400
+        
+        user_email = user.email
+        user_full_name = user.full_name or "User"
+        
+        # Delete the user
+        db.session.delete(user)
+        db.session.commit()
+        
+        # Send deletion notification email
+        try:
+            subject = "Star4ce – Account Cancellation"
+            body = f"""Hello {user_full_name},
+
+Your Star4ce account ({user_email}) has been canceled and deleted as requested.
+
+If you change your mind, you can register again at any time.
+
+Thank you for your interest in Star4ce.
+
+– Star4ce Team
+"""
+            send_email_via_resend_or_smtp(user_email, subject, body)
+            print(f"[DELETION] Account deleted and notification sent to {user_email}", flush=True)
+        except Exception as e:
+            print(f"[DELETION WARNING] Account deleted but email failed: {e}", flush=True)
+            # Don't fail the deletion if email fails
+        
+        return jsonify(
+            ok=True,
+            message=f"Account deleted successfully. Notification email sent to {user_email}."
+        )
+    except Exception as e:
+        db.session.rollback()
+        print(f"[DELETION ERROR] {str(e)}", flush=True)
+        return jsonify(error=f"Deletion failed: {str(e)}"), 500
+
 if __name__ == "__main__":
-    # For local development only
-    # Production uses gunicorn (see Procfile)
     port = int(os.getenv("PORT", 5000))
     debug = os.getenv("ENVIRONMENT") != "production"
     app.run(host="0.0.0.0", port=port, debug=debug)
