@@ -185,6 +185,7 @@ class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(db.String(255), unique=True, nullable=False)
     password_hash = db.Column(db.String(255), nullable=False)
+    full_name = db.Column(db.String(255), nullable=True)  # Full name of the user
 
     # Roles:
     # - "admin"      = owner of a single dealership (uses dealership_id)
@@ -230,6 +231,7 @@ class User(db.Model):
             "role": self.role,
             "is_verified": self.is_verified,
             "dealership_id": self.dealership_id,
+            "full_name": self.full_name,
         }
 
 
@@ -1045,106 +1047,119 @@ def get_public_dealerships():
 @app.post("/auth/register")
 @limiter.limit("3 per hour")
 def register():
-    data = request.get_json(force=True) or {}
-    email = sanitize_input(data.get("email") or "").strip().lower()
-    password = data.get("password") or ""
-    dealership_id = data.get("dealership_id")  # Optional for manager registration
-    is_admin_registration = data.get("is_admin_registration", False)  # Flag for admin registration via subscription
+    try:
+        data = request.get_json(force=True) or {}
+        email = sanitize_input(data.get("email") or "").strip().lower()
+        password = data.get("password") or ""
+        dealership_id = data.get("dealership_id")  # Optional for manager registration
+        is_admin_registration = data.get("is_admin_registration", False)  # Flag for admin registration via subscription
 
-    if not email or not password:
-        return jsonify(error="Please enter both email and password"), 400
-    
-    if not validate_email(email):
-        return jsonify(error="Please enter a valid email address"), 400
+        if not email or not password:
+            return jsonify(error="Please enter both email and password"), 400
+        
+        if not validate_email(email):
+            return jsonify(error="Please enter a valid email address"), 400
 
-    if not validate_password(password):
-        return jsonify(error="Password must be at least 8 characters and include both letters and numbers"), 400
+        if not validate_password(password):
+            return jsonify(error="Password must be at least 8 characters and include both letters and numbers"), 400
 
-    existing = User.query.filter_by(email=email).first()
-    if existing:
-        # If this is an admin registration and the existing user is a pending admin registration
-        # (manager, not verified, not approved, no dealership), clean them up and allow re-registration
-        if (is_admin_registration and 
-            existing.role == "manager" and 
-            not existing.is_verified and 
-            not existing.is_approved and 
-            not existing.dealership_id):
-            # This is a pending admin registration that was never completed - delete it
-            db.session.delete(existing)
-            db.session.commit()
-            # Continue with registration below
+        existing = User.query.filter_by(email=email).first()
+        if existing:
+            # If this is an admin registration and the existing user is a pending admin registration
+            # (manager, not verified, not approved, no dealership), clean them up and allow re-registration
+            if (is_admin_registration and 
+                existing.role == "manager" and 
+                not existing.is_verified and 
+                not existing.is_approved and 
+                not existing.dealership_id):
+                # This is a pending admin registration that was never completed - delete it
+                db.session.delete(existing)
+                db.session.commit()
+                # Continue with registration below
+            else:
+                # User exists and is not a pending admin registration - they should sign in
+                return jsonify(error="This email is already registered. Please sign in instead."), 400
+
+        # Determine role from request or default to manager
+        requested_role = data.get("role", "").strip().lower()
+        if requested_role in ("manager", "corporate"):
+            role = requested_role
         else:
-            # User exists and is not a pending admin registration - they should sign in
-            return jsonify(error="This email is already registered. Please sign in instead."), 400
+            # Default to manager for public registration
+            # If is_admin_registration is True, user will be upgraded to admin after Stripe payment.
+            role = "manager"
 
-    # Determine role from request or default to manager
-    requested_role = data.get("role", "").strip().lower()
-    if requested_role in ("manager", "corporate"):
-        role = requested_role
-    else:
-        # Default to manager for public registration
-        # If is_admin_registration is True, user will be upgraded to admin after Stripe payment.
-        role = "manager"
+        # For manager registration, validate dealership_id but don't assign directly - create a request instead
+        manager_request_id = None
+        if dealership_id and not is_admin_registration and role == "manager":
+            dealership = Dealership.query.get(dealership_id)
+            if not dealership:
+                return jsonify(error="Invalid dealership selected"), 400
 
-    # For manager registration, validate dealership_id but don't assign directly - create a request instead
-    manager_request_id = None
-    if dealership_id and not is_admin_registration and role == "manager":
-        dealership = Dealership.query.get(dealership_id)
-        if not dealership:
-            return jsonify(error="Invalid dealership selected"), 400
+        # Generate 6-digit verification code
+        code_int = secrets.randbelow(1_000_000)  # 0..999999
+        verification_code = f"{code_int:06d}"
+        expires_at = datetime.datetime.utcnow() + datetime.timedelta(hours=1)
 
-    # Generate 6-digit verification code
-    code_int = secrets.randbelow(1_000_000)  # 0..999999
-    verification_code = f"{code_int:06d}"
-    expires_at = datetime.datetime.utcnow() + datetime.timedelta(hours=1)
-
-    user = User(
-        email=email,
-        password_hash=generate_password_hash(password),
-        role=role,
-        dealership_id=None,  # Managers don't get assigned directly - they must request access
-        is_approved=False,  # Managers need admin approval (will be auto-approved after payment for admin registration)
-        is_verified=False,  # Will be auto-verified after payment for admin registration
-        verification_code=verification_code,
-        verification_expires_at=expires_at,
-    )
-
-    db.session.add(user)
-    db.session.flush()  # Get the user ID
-
-    # For manager registration, create a dealership access request
-    if dealership_id and not is_admin_registration and role == "manager":
-        manager_request = ManagerDealershipRequest(
-            manager_id=user.id,
-            dealership_id=dealership_id,
-            status="pending"
+        # Get full_name for admin registration
+        full_name = None
+        if is_admin_registration:
+            full_name = data.get("full_name", "").strip() or None
+        
+        user = User(
+            email=email,
+            password_hash=generate_password_hash(password),
+            role=role,
+            full_name=full_name,
+            dealership_id=None,  # Managers don't get assigned directly - they must request access
+            is_approved=False,  # Managers need admin approval (will be auto-approved after payment for admin registration)
+            is_verified=False,  # Will be auto-verified after payment for admin registration
+            verification_code=verification_code,
+            verification_expires_at=expires_at,
         )
-        db.session.add(manager_request)
-        db.session.flush()
-        manager_request_id = manager_request.id
 
-    db.session.commit()
+        db.session.add(user)
+        db.session.flush()  # Get the user ID
 
-    # For admin registration, don't send verification email (will be auto-verified after payment)
-    # For manager registration, send verification email
-    if not is_admin_registration:
-        send_verification_email(user.email, verification_code)
-        if manager_request_id:
-            message = "Verification code sent to your email. Please verify before logging in. Your request to join the dealership is pending admin approval."
+        # For manager registration, create a dealership access request
+        if dealership_id and not is_admin_registration and role == "manager":
+            manager_request = ManagerDealershipRequest(
+                manager_id=user.id,
+                dealership_id=dealership_id,
+                status="pending"
+            )
+            db.session.add(manager_request)
+            db.session.flush()
+            manager_request_id = manager_request.id
+
+        db.session.commit()
+
+        # For admin registration, don't send verification email (will be auto-verified after payment)
+        # For manager registration, send verification email
+        if not is_admin_registration:
+            send_verification_email(user.email, verification_code)
+            if manager_request_id:
+                message = "Verification code sent to your email. Please verify before logging in. Your request to join the dealership is pending admin approval."
+            else:
+                message = "Verification code sent to your email. Please verify before logging in."
         else:
-            message = "Verification code sent to your email. Please verify before logging in."
-    else:
-        message = "Account created. Complete your subscription payment to become an admin."
+            message = "Account created. Complete your subscription payment to become an admin."
 
-    # Do NOT log them in yet; they must verify first (or complete payment for admin registration).
-    return jsonify(
-        ok=True,
-        email=user.email,
-        role=user.role,
-        dealership_id=dealership_id,
-        user_id=user.id,  # Return user_id for checkout session
-        message=message
-    )
+        # Do NOT log them in yet; they must verify first (or complete payment for admin registration).
+        return jsonify(
+            ok=True,
+            email=user.email,
+            role=user.role,
+            dealership_id=dealership_id,
+            user_id=user.id,  # Return user_id for checkout session
+            message=message
+        )
+    except Exception as e:
+        db.session.rollback()
+        print(f"[REGISTER ERROR] {str(e)}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify(error=f"Registration failed: {str(e)}"), 500
 
 @app.get("/auth/me")
 def me():
@@ -2992,12 +3007,19 @@ def create_checkout_session():
                 }],
                 mode="subscription",
                 success_url=f"{FRONTEND_URL}/dashboard?subscription=success",
-                cancel_url=f"{FRONTEND_URL}/dashboard?subscription=canceled",
+                cancel_url=f"{FRONTEND_URL}/admin-register?subscription=canceled&user_id={user_id_for_checkout}",
                 metadata={
                     "user_id": str(user_id_for_checkout),
                     "dealership_id": str(dealership_id) if dealership_id else "new",
                     "user_email": email,
-                    "is_new_admin": "true" if not user or user.role != "admin" else "false"
+                    "is_new_admin": "true" if not user or user.role != "admin" else "false",
+                    # Dealership info for new admin registration
+                    # Stripe metadata values must be strings, so convert None to empty string
+                    "dealership_name": (data.get("dealership_name") or "").strip() or "",
+                    "dealership_address": (data.get("dealership_address") or "").strip() or "",
+                    "dealership_city": (data.get("dealership_city") or "").strip() or "",
+                    "dealership_state": (data.get("dealership_state") or "").strip() or "",
+                    "dealership_zip_code": (data.get("dealership_zip_code") or "").strip() or "",
                 },
             )
         except stripe._error.InvalidRequestError as e:
@@ -3162,8 +3184,19 @@ def handle_checkout_completed(session):
         
         if not dealership:
             # Create new dealership for this user
+            # Get dealership info from metadata if provided
+            dealership_name = metadata.get("dealership_name", "").strip() or f"Dealership for {user.email}"
+            dealership_address = metadata.get("dealership_address", "").strip() or None
+            dealership_city = metadata.get("dealership_city", "").strip() or None
+            dealership_state = metadata.get("dealership_state", "").strip() or None
+            dealership_zip_code = metadata.get("dealership_zip_code", "").strip() or None
+            
             dealership = Dealership(
-                name=f"Dealership for {user.email}",
+                name=dealership_name,
+                address=dealership_address,
+                city=dealership_city,
+                state=dealership_state,
+                zip_code=dealership_zip_code,
                 subscription_status="active",
                 subscription_plan="pro",
                 trial_ends_at=None,  # No trial, they paid
