@@ -3373,6 +3373,87 @@ def cancel_subscription():
         print(f"[ERROR] Cancel subscription failed: {e}", flush=True)
         import traceback
         traceback.print_exc()
+
+@app.post("/subscription/resume")
+@limiter.limit("5 per hour")
+def resume_subscription():
+    """
+    Resume a subscription that was scheduled to cancel at period end.
+    - Admin: Resumes their own dealership's subscription
+    - Corporate: Must provide dealership_id in request body for assigned dealerships
+    """
+    user, err = get_current_user()
+    if err:
+        return err
+    
+    if user.role not in ("admin", "corporate"):
+        return jsonify(error="only admins and corporate users can resume subscriptions"), 403
+    
+    if not STRIPE_AVAILABLE or not STRIPE_SECRET_KEY:
+        return jsonify(error="Stripe not configured"), 503
+    
+    # Determine which dealership to resume subscription for
+    dealership_id = None
+    if user.role == "admin":
+        dealership_id = user.dealership_id
+        if not dealership_id:
+            return jsonify(error="No subscription found"), 404
+    elif user.role == "corporate":
+        data = request.get_json(silent=True) or {}
+        dealership_id = data.get("dealership_id")
+        if not dealership_id:
+            return jsonify(error="dealership_id is required in request body for corporate users"), 400
+        
+        # Check if corporate user has access to this dealership
+        accessible_dealership_ids = get_accessible_dealership_ids(user)
+        if dealership_id not in accessible_dealership_ids:
+            return jsonify(error="you do not have access to this dealership"), 403
+    
+    dealership = Dealership.query.get(dealership_id)
+    if not dealership:
+        return jsonify(error="Dealership not found"), 404
+    
+    if not dealership.stripe_subscription_id:
+        return jsonify(error="No active subscription found"), 404
+    
+    try:
+        # Resume subscription in Stripe by removing cancel_at_period_end
+        subscription = stripe.Subscription.retrieve(dealership.stripe_subscription_id)
+        
+        if subscription.status != "active":
+            return jsonify(error="Subscription is not active"), 400
+        
+        if not subscription.get("cancel_at_period_end", False):
+            return jsonify(error="Subscription is not scheduled for cancellation"), 400
+        
+        # Remove cancellation - resume subscription
+        resumed_sub = stripe.Subscription.modify(
+            dealership.stripe_subscription_id,
+            cancel_at_period_end=False
+        )
+        
+        # Update database
+        dealership.subscription_status = "active"
+        period_end = resumed_sub.get("current_period_end")
+        if period_end:
+            dealership.subscription_ends_at = datetime.datetime.fromtimestamp(period_end)
+        db.session.commit()
+        
+        return jsonify(
+            ok=True,
+            message="Subscription resumed successfully",
+            subscription_status=dealership.subscription_status
+        )
+    except stripe._error.InvalidRequestError as e:
+        print(f"[STRIPE ERROR] Resume subscription failed: {e}", flush=True)
+        if "No such subscription" in str(e):
+            return jsonify(error="Subscription not found in Stripe"), 404
+        return jsonify(error=f"Failed to resume subscription: {str(e)}"), 500
+    except Exception as e:
+        print(f"[ERROR] Resume subscription failed: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify(error=f"Failed to resume subscription: {str(e)}"), 500
         return jsonify(error="Failed to cancel subscription"), 500
 
 @app.get("/corporate/subscriptions")
@@ -3397,6 +3478,15 @@ def get_corporate_subscriptions():
     
     subscriptions = []
     for dealership in dealerships:
+        # Check cancel_at_period_end from Stripe if subscription exists
+        cancel_at_period_end = False
+        if STRIPE_AVAILABLE and STRIPE_SECRET_KEY and dealership.stripe_subscription_id:
+            try:
+                subscription = stripe.Subscription.retrieve(dealership.stripe_subscription_id)
+                cancel_at_period_end = subscription.get("cancel_at_period_end", False)
+            except:
+                pass  # If we can't retrieve, just use False
+        
         subscriptions.append({
             "dealership_id": dealership.id,
             "dealership_name": dealership.name,
@@ -3406,6 +3496,7 @@ def get_corporate_subscriptions():
             "subscription_ends_at": dealership.subscription_ends_at.isoformat() + "Z" if dealership.subscription_ends_at else None,
             "days_remaining_in_trial": dealership.days_remaining_in_trial(),
             "is_active": dealership.is_subscription_active(),
+            "cancel_at_period_end": cancel_at_period_end,
         })
     
     return jsonify(
