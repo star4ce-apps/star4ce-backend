@@ -589,6 +589,47 @@ def get_current_user():
     if not user:
         return None, (jsonify(error="user not found"), 401)
 
+    # Auto-upgrade users with active subscriptions to admin
+    # This handles cases where webhook didn't fire or user subscribed before webhook was set up
+    if user.role == "manager" and user.dealership_id:
+        dealership = Dealership.query.get(user.dealership_id)
+        if dealership and dealership.is_subscription_active():
+            # User has active subscription but is still manager - upgrade to admin
+            user.role = "admin"
+            user.is_verified = True
+            user.is_approved = True
+            if not user.approved_at:
+                user.approved_at = datetime.datetime.utcnow()
+            db.session.commit()
+            print(f"[AUTO-UPGRADE] User {user.email} auto-upgraded to admin (has active subscription)", flush=True)
+    elif user.role == "manager" and not user.dealership_id:
+        # Check if user has any dealership with active subscription (by email matching Stripe customer)
+        if STRIPE_AVAILABLE and STRIPE_SECRET_KEY:
+            try:
+                # Try to find dealership by Stripe customer email
+                dealerships = Dealership.query.filter(
+                    Dealership.stripe_customer_id.isnot(None)
+                ).all()
+                for dealership in dealerships:
+                    if dealership.stripe_customer_id:
+                        try:
+                            customer = stripe.Customer.retrieve(dealership.stripe_customer_id)
+                            if customer.get("email") == user.email and dealership.is_subscription_active():
+                                # User has active subscription - upgrade and assign
+                                user.role = "admin"
+                                user.dealership_id = dealership.id
+                                user.is_verified = True
+                                user.is_approved = True
+                                if not user.approved_at:
+                                    user.approved_at = datetime.datetime.utcnow()
+                                db.session.commit()
+                                print(f"[AUTO-UPGRADE] User {user.email} auto-upgraded to admin (found by Stripe customer)", flush=True)
+                                break
+                        except:
+                            pass  # Skip if Stripe customer lookup fails
+            except:
+                pass  # Skip if Stripe is not available
+
     # Require email to be verified to access protected routes
     if not user.is_verified:
         return None, (jsonify(error="unverified"), 403)
@@ -913,6 +954,47 @@ def login():
     if not check_password_hash(user.password_hash, password):
         return jsonify(error="invalid credentials"), 401
 
+    # Auto-upgrade users with active subscriptions to admin
+    # This handles cases where webhook didn't fire or user subscribed before webhook was set up
+    if user.role == "manager" and user.dealership_id:
+        dealership = Dealership.query.get(user.dealership_id)
+        if dealership and dealership.is_subscription_active():
+            # User has active subscription but is still manager - upgrade to admin
+            user.role = "admin"
+            user.is_verified = True
+            user.is_approved = True
+            if not user.approved_at:
+                user.approved_at = datetime.datetime.utcnow()
+            db.session.commit()
+            print(f"[AUTO-UPGRADE] User {user.email} auto-upgraded to admin on login (has active subscription)", flush=True)
+    elif user.role == "manager" and not user.dealership_id:
+        # Check if user has any dealership with active subscription (by email matching Stripe customer)
+        if STRIPE_AVAILABLE and STRIPE_SECRET_KEY:
+            try:
+                # Try to find dealership by Stripe customer email
+                dealerships = Dealership.query.filter(
+                    Dealership.stripe_customer_id.isnot(None)
+                ).all()
+                for dealership in dealerships:
+                    if dealership.stripe_customer_id:
+                        try:
+                            customer = stripe.Customer.retrieve(dealership.stripe_customer_id)
+                            if customer.get("email") == user.email and dealership.is_subscription_active():
+                                # User has active subscription - upgrade and assign
+                                user.role = "admin"
+                                user.dealership_id = dealership.id
+                                user.is_verified = True
+                                user.is_approved = True
+                                if not user.approved_at:
+                                    user.approved_at = datetime.datetime.utcnow()
+                                db.session.commit()
+                                print(f"[AUTO-UPGRADE] User {user.email} auto-upgraded to admin on login (found by Stripe customer)", flush=True)
+                                break
+                        except:
+                            pass  # Skip if Stripe customer lookup fails
+            except:
+                pass  # Skip if Stripe is not available
+
     # Password is correct, now check verification
     if not user.is_verified:
         # generate a fresh verification code and resend
@@ -931,7 +1013,7 @@ def login():
             message="Your email is not verified yet. A new verification code has been sent to your email."
         ), 403
 
-    # Issue JWT based on DB user
+    # Issue JWT based on DB user (will now have updated role if auto-upgraded)
     token = make_token(user.email, user.role)
 
     return jsonify(
@@ -1086,10 +1168,94 @@ def me():
         if not user:
             return jsonify(error="user not found"), 401
         
+        # Auto-upgrade users with active subscriptions to admin
+        # This handles cases where webhook didn't fire or user subscribed before webhook was set up
+        if user.role == "manager" and user.dealership_id:
+            dealership = Dealership.query.get(user.dealership_id)
+            if dealership and dealership.is_subscription_active():
+                # User has active subscription but is still manager - upgrade to admin
+                user.role = "admin"
+                user.is_verified = True
+                user.is_approved = True
+                if not user.approved_at:
+                    user.approved_at = datetime.datetime.utcnow()
+                db.session.commit()
+                print(f"[AUTO-UPGRADE] User {user.email} auto-upgraded to admin in /auth/me (has active subscription)", flush=True)
+        elif user.role == "manager" and not user.dealership_id:
+            # Check if user has any dealership with active subscription (by email matching Stripe customer)
+            if STRIPE_AVAILABLE and STRIPE_SECRET_KEY:
+                try:
+                    # First, try to find dealership by Stripe customer email in database
+                    dealerships = Dealership.query.filter(
+                        Dealership.stripe_customer_id.isnot(None)
+                    ).all()
+                    for dealership in dealerships:
+                        if dealership.stripe_customer_id:
+                            try:
+                                customer = stripe.Customer.retrieve(dealership.stripe_customer_id)
+                                if customer.get("email") == user.email and dealership.is_subscription_active():
+                                    # User has active subscription - upgrade and assign
+                                    user.role = "admin"
+                                    user.dealership_id = dealership.id
+                                    user.is_verified = True
+                                    user.is_approved = True
+                                    if not user.approved_at:
+                                        user.approved_at = datetime.datetime.utcnow()
+                                    db.session.commit()
+                                    print(f"[AUTO-UPGRADE] User {user.email} auto-upgraded to admin in /auth/me (found by Stripe customer)", flush=True)
+                                    break
+                            except:
+                                pass  # Skip if Stripe customer lookup fails
+                    
+                    # If not found, try querying Stripe directly for customers with this email
+                    if user.role == "manager":
+                        try:
+                            customers = stripe.Customer.list(email=user.email, limit=10)
+                            for customer in customers.data:
+                                # Check if this customer has an active subscription
+                                subscriptions = stripe.Subscription.list(customer=customer.id, status="active", limit=1)
+                                if subscriptions.data:
+                                    # Customer has active subscription - create or find dealership
+                                    dealership = Dealership.query.filter_by(stripe_customer_id=customer.id).first()
+                                    if not dealership:
+                                        # Create new dealership for this subscription
+                                        subscription = subscriptions.data[0]
+                                        dealership = Dealership(
+                                            name=f"Dealership for {user.email}",
+                                            subscription_status="active",
+                                            subscription_plan="pro",
+                                            stripe_customer_id=customer.id,
+                                            stripe_subscription_id=subscription.id,
+                                            trial_ends_at=None,
+                                        )
+                                        if subscription.get("current_period_end"):
+                                            dealership.subscription_ends_at = datetime.datetime.fromtimestamp(subscription.current_period_end)
+                                        else:
+                                            dealership.subscription_ends_at = datetime.datetime.utcnow() + datetime.timedelta(days=30)
+                                        db.session.add(dealership)
+                                        db.session.flush()
+                                    
+                                    # Upgrade user to admin
+                                    user.role = "admin"
+                                    user.dealership_id = dealership.id
+                                    user.is_verified = True
+                                    user.is_approved = True
+                                    if not user.approved_at:
+                                        user.approved_at = datetime.datetime.utcnow()
+                                    db.session.commit()
+                                    print(f"[AUTO-UPGRADE] User {user.email} auto-upgraded to admin in /auth/me (found active Stripe subscription)", flush=True)
+                                    break
+                        except Exception as e:
+                            print(f"[AUTO-UPGRADE] Error querying Stripe: {e}", flush=True)
+                            pass  # Skip if Stripe query fails
+                except:
+                    pass  # Skip if Stripe is not available
+
         if not user.is_verified:
             return jsonify(error="unverified"), 403
         
-        return jsonify(ok=True, user={"email": email, "role": claims.get("role", "admin")})
+        # Return role from database (not from token) since it may have been auto-upgraded
+        return jsonify(ok=True, user={"email": user.email, "role": user.role})
     except ValueError as e:
         # Token expired or invalid
         error_msg = str(e)
@@ -2976,9 +3142,12 @@ def handle_checkout_completed(session):
             return
         
         # If this is a new admin registration, ensure user is verified and approved
-        if is_new_admin:
+        # Always verify and approve users who complete checkout (they paid)
+        if is_new_admin or user.role == "manager":
             user.is_verified = True  # Auto-verify on payment
             user.is_approved = True  # Auto-approve on payment
+            if not user.approved_at:
+                user.approved_at = datetime.datetime.utcnow()
             # Also check if user has no password (created during checkout) and needs one set
             # This shouldn't happen if we create user before checkout, but safety check
 
