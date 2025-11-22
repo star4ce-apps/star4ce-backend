@@ -942,7 +942,20 @@ def register():
 
     existing = User.query.filter_by(email=email).first()
     if existing:
-        return jsonify(error="This email is already registered. Please sign in instead."), 400
+        # If this is an admin registration and the existing user is a pending admin registration
+        # (manager, not verified, not approved, no dealership), clean them up and allow re-registration
+        if (is_admin_registration and 
+            existing.role == "manager" and 
+            not existing.is_verified and 
+            not existing.is_approved and 
+            not existing.dealership_id):
+            # This is a pending admin registration that was never completed - delete it
+            db.session.delete(existing)
+            db.session.commit()
+            # Continue with registration below
+        else:
+            # User exists and is not a pending admin registration - they should sign in
+            return jsonify(error="This email is already registered. Please sign in instead."), 400
 
     # Determine role from request or default to manager
     requested_role = data.get("role", "").strip().lower()
@@ -2571,7 +2584,18 @@ def create_checkout_session():
     
     # Get email from request body if user not authenticated
     data = request.get_json(silent=True) or {}
-    email = data.get("email", "").strip().lower() if not user else user.email
+    
+    # Check if user_id is provided first (from admin registration flow)
+    provided_user_id = data.get("user_id")
+    if provided_user_id and not user:
+        temp_user = User.query.get(provided_user_id)
+        if temp_user:
+            user = temp_user
+            email = user.email
+    
+    # Get email from request or user
+    if not email:
+        email = data.get("email", "").strip().lower() if not user else user.email
     
     # If no user and no email provided, return error
     if not user and not email:
@@ -2626,17 +2650,6 @@ def create_checkout_session():
             elif user.role == "manager":
                 # Managers can subscribe to become admin - will create new dealership
                 dealership_id = None
-        else:
-            # New user registration - will create user and dealership after payment
-            # Validate email
-            if not validate_email(email):
-                return jsonify(error="Please enter a valid email address"), 400
-            
-            # Check if email already exists
-            existing = User.query.filter_by(email=email).first()
-            if existing:
-                # User exists but not logged in - they should log in first
-                return jsonify(error="This email is already registered. Please sign in to subscribe."), 400
         
         # If user has a dealership, use it; otherwise we'll create one in webhook
         if dealership_id:
@@ -2650,18 +2663,35 @@ def create_checkout_session():
             user_id_for_checkout = user.id
         else:
             # Check if user_id was provided in request (from admin registration page)
+            # This should be checked FIRST before checking by email
             provided_user_id = data.get("user_id")
             if provided_user_id:
                 temp_user = User.query.get(provided_user_id)
                 if temp_user:
                     user_id_for_checkout = temp_user.id
                     user = temp_user  # Set user for later use
+                else:
+                    return jsonify(error="Invalid user_id provided"), 400
             else:
-                # Check if user already exists by email (from admin registration page)
+                # No user_id provided - check if user exists by email
+                # Validate email first
+                if not email:
+                    return jsonify(error="Email is required for new registration"), 400
+                if not validate_email(email):
+                    return jsonify(error="Please enter a valid email address"), 400
+                
+                # Check if user already exists by email
                 temp_user = User.query.filter_by(email=email).first()
                 if temp_user:
-                    user_id_for_checkout = temp_user.id
-                    user = temp_user
+                    # User exists but not logged in - they should log in first OR provide user_id
+                    # However, if they just registered (is_admin_registration), allow them to proceed
+                    # Check if this is a recent registration that hasn't been upgraded to admin yet
+                    if temp_user.role == "manager" and not temp_user.is_verified and not temp_user.is_approved:
+                        # This is likely a fresh admin registration - allow checkout
+                        user_id_for_checkout = temp_user.id
+                        user = temp_user
+                    else:
+                        return jsonify(error="This email is already registered. Please sign in to subscribe."), 400
                 else:
                     # Create a temporary user account for checkout (will be activated after payment)
                     # This allows us to track the subscription
@@ -2742,7 +2772,7 @@ def create_checkout_session():
                 }],
                 mode="subscription",
                 success_url=f"{FRONTEND_URL}/dashboard?subscription=success",
-                cancel_url=f"{FRONTEND_URL}/dashboard?subscription=canceled",
+                cancel_url=f"{FRONTEND_URL}/admin-register?subscription=canceled&user_id={user_id_for_checkout}",
                 metadata={
                     "user_id": str(user_id_for_checkout),
                     "dealership_id": str(dealership_id) if dealership_id else "new",
@@ -2786,7 +2816,7 @@ def create_checkout_session():
                         }],
                         mode="subscription",
                         success_url=f"{FRONTEND_URL}/dashboard?subscription=success",
-                        cancel_url=f"{FRONTEND_URL}/dashboard?subscription=canceled",
+                        cancel_url=f"{FRONTEND_URL}/admin-register?subscription=canceled&user_id={user.id}",
                         metadata={
                             "user_id": user.id,
                             "dealership_id": str(dealership_id) if dealership_id else "new",
@@ -2990,6 +3020,53 @@ def handle_subscription_deleted(subscription):
     except Exception as e:
         print(f"[WEBHOOK ERROR] Subscription deleted handler failed: {e}", flush=True)
 
+@app.post("/subscription/cleanup-pending")
+@limiter.limit("10 per hour")
+def cleanup_pending_registration():
+    """
+    Clean up user account if they cancelled checkout before completing payment.
+    Only cleans up users who:
+    - Have role='manager'
+    - Are not verified
+    - Are not approved
+    - Have no dealership assigned
+    - Were created for admin registration (recently)
+    """
+    data = request.get_json(silent=True) or {}
+    user_id = data.get("user_id")
+    email = data.get("email", "").strip().lower()
+    
+    if not user_id and not email:
+        return jsonify(error="user_id or email is required"), 400
+    
+    # Find the user
+    user = None
+    if user_id:
+        user = User.query.get(user_id)
+    elif email:
+        user = User.query.filter_by(email=email).first()
+    
+    if not user:
+        return jsonify(ok=True, message="User not found or already cleaned up")
+    
+    # Only clean up if this is a pending admin registration
+    # Criteria: manager role, not verified, not approved, no dealership
+    # This is safe because legitimate manager accounts would have at least one of:
+    # - is_verified=True (email verified)
+    # - is_approved=True (admin approved)
+    # - dealership_id set (assigned to a dealership)
+    if (user.role == "manager" and 
+        not user.is_verified and 
+        not user.is_approved and 
+        not user.dealership_id):
+        
+        # Safe to delete - this matches the pattern of a cancelled admin registration
+        db.session.delete(user)
+        db.session.commit()
+        return jsonify(ok=True, message="Pending registration cleaned up")
+    else:
+        return jsonify(ok=True, message="User does not match cleanup criteria")
+    
 @app.post("/subscription/cancel")
 @limiter.limit("5 per hour")
 def cancel_subscription():

@@ -63,13 +63,16 @@ python app.py
 **Local Development**: SQLite (automatic, no setup needed)  
 **Production**: PostgreSQL (on Render)
 
-### Manage Users (Local)
+### Manage Database (Local)
 ```bash
-# List all users
-python delete_user.py list
+# Reset database (delete and recreate all tables)
+python reset_db.py
+# Or skip confirmation:
+python reset_db.py --yes
 
-# Delete a user
-python delete_user.py user@email.com --yes
+# Manage users
+python delete_user.py list          # List all users
+python delete_user.py user@email.com --yes  # Delete a user
 ```
 
 ---
