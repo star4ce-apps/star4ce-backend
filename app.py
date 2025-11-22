@@ -16,6 +16,7 @@ from flask_limiter.util import get_remote_address
 from dotenv import load_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask import g
+from sqlalchemy import text, inspect
 import re
 
 load_dotenv()
@@ -4619,7 +4620,6 @@ with app.app_context():
     
     # Migrate: Add new columns to users table if they don't exist
     try:
-        from sqlalchemy import text, inspect
         inspector = inspect(db.engine)
         
         # Check if is_approved column exists (works for both PostgreSQL and SQLite)
