@@ -2752,28 +2752,50 @@ def get_subscription_status():
     if not dealership:
         return jsonify(error="dealership not found"), 404
 
-    # Sync with Stripe if we have a customer ID (in case webhook didn't fire)
-    if STRIPE_AVAILABLE and STRIPE_SECRET_KEY and dealership.stripe_customer_id:
+    # Sync with Stripe if we have a subscription ID or customer ID (in case webhook didn't fire)
+    cancel_at_period_end = False
+    if STRIPE_AVAILABLE and STRIPE_SECRET_KEY:
         try:
-            # Check for active subscriptions in Stripe
-            subscriptions = stripe.Subscription.list(
-                customer=dealership.stripe_customer_id,
-                status="active",
-                limit=1
-            )
-            
-            if subscriptions.data:
-                # Found active subscription in Stripe - sync database
-                active_sub = subscriptions.data[0]
-                if dealership.subscription_status != "active" or dealership.stripe_subscription_id != active_sub.id:
-                    print(f"[SYNC] Syncing subscription status from Stripe for customer {dealership.stripe_customer_id}", flush=True)
-                    dealership.subscription_status = "active"
-                    dealership.stripe_subscription_id = active_sub.id
-                    dealership.subscription_plan = "pro"
-                    current_period_end = active_sub.get("current_period_end")
+            # If we have a subscription ID, check it directly
+            if dealership.stripe_subscription_id:
+                try:
+                    subscription = stripe.Subscription.retrieve(dealership.stripe_subscription_id)
+                    cancel_at_period_end = subscription.get("cancel_at_period_end", False)
+                    current_period_end = subscription.get("current_period_end")
                     if current_period_end:
                         dealership.subscription_ends_at = datetime.datetime.fromtimestamp(current_period_end)
+                    # Update status based on Stripe
+                    if subscription.status == "active" and cancel_at_period_end:
+                        dealership.subscription_status = "active"  # Still active but will cancel
+                    elif subscription.status == "canceled":
+                        dealership.subscription_status = "canceled"
                     db.session.commit()
+                except stripe._error.InvalidRequestError:
+                    # Subscription not found in Stripe, check by customer
+                    pass
+            
+            # Also check for active subscriptions by customer ID
+            if dealership.stripe_customer_id:
+                subscriptions = stripe.Subscription.list(
+                    customer=dealership.stripe_customer_id,
+                    status="all",  # Check all statuses to find the subscription
+                    limit=10
+                )
+                
+                if subscriptions.data:
+                    # Find the most recent subscription
+                    active_sub = subscriptions.data[0]
+                    cancel_at_period_end = active_sub.get("cancel_at_period_end", False)
+                    
+                    if dealership.subscription_status != "active" or dealership.stripe_subscription_id != active_sub.id:
+                        print(f"[SYNC] Syncing subscription status from Stripe for customer {dealership.stripe_customer_id}", flush=True)
+                        dealership.subscription_status = "active" if active_sub.status == "active" else active_sub.status
+                        dealership.stripe_subscription_id = active_sub.id
+                        dealership.subscription_plan = "pro"
+                        current_period_end = active_sub.get("current_period_end")
+                        if current_period_end:
+                            dealership.subscription_ends_at = datetime.datetime.fromtimestamp(current_period_end)
+                        db.session.commit()
             elif dealership.subscription_status == "active":
                 # Database says active but Stripe says no active subscription - check all statuses
                 all_subs = stripe.Subscription.list(customer=dealership.stripe_customer_id, limit=10)
@@ -2790,6 +2812,7 @@ def get_subscription_status():
                         "incomplete_expired": "expired",
                     }
                     mapped_status = status_map.get(latest_sub.status, "expired")
+                    cancel_at_period_end = latest_sub.get("cancel_at_period_end", False)
                     dealership.subscription_status = mapped_status
                     dealership.stripe_subscription_id = latest_sub.id
                     current_period_end = latest_sub.get("current_period_end")
@@ -2808,6 +2831,7 @@ def get_subscription_status():
         subscription_ends_at=dealership.subscription_ends_at.isoformat() + "Z" if dealership.subscription_ends_at else None,
         days_remaining_in_trial=dealership.days_remaining_in_trial(),
         is_active=dealership.is_subscription_active(),
+        cancel_at_period_end=cancel_at_period_end,
     )
 
 @app.post("/subscription/create-checkout")
